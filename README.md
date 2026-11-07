@@ -4,8 +4,6 @@
 
 A small, fast screenshot and annotation tool for Windows. Press Print Screen, drag a region or click a window, mark it up right there, and press Enter. It works on its own: nothing else needs to be installed.
 
-Created in [T3 Code](https://t3.codes).
-
 ## What it does
 
 - **Region, window or screen.** Drag to select, or click to take the window under the cursor. Resize with the handles, or nudge with the arrow keys (Ctrl+arrows resize). F takes the whole monitor and Ctrl+A every monitor.
@@ -39,8 +37,14 @@ Change the shortcuts in Settings (right-click the tray icon, then Settings…): 
 
 ## Install
 
+Download **Prism-Setup-<version>.exe** from [Releases](https://github.com/Beroris/prism/releases/latest) and run it. It installs for you only, so it doesn't ask for admin rights, and adds Prism to the Start menu. Uninstall it from Settings → Apps like any other app; that also gives Print Screen back to Snipping Tool if Prism had it.
+
+To run Prism without installing, download the zip instead and start `prism.exe`.
+
+From a clone of this repo, these build and install it for you only:
+
 ```
-pwsh scripts/install-windows.ps1              # installs for you only, adds a Start menu entry, starts it
+pwsh scripts/install-windows.ps1              # installs, adds a Start menu entry, starts it
 pwsh scripts/install-windows.ps1 -Uninstall   # removes it (add -Purge to delete settings too)
 ```
 
@@ -74,7 +78,7 @@ You need Rust 1.85 or newer.
 ```sh
 cargo build --release -p prism-windows        # target/release/prism.exe
 cargo test --workspace
-pwsh scripts/package-windows.ps1             # dist/prism-<version>-windows-x64.zip
+pwsh scripts/package-windows.ps1             # dist/: the installer, a zip and SHA256SUMS.txt (needs Inno Setup 6)
 ```
 
 To regenerate the icon, run `cargo run -p prism-core --example make_ico`.
@@ -85,6 +89,7 @@ To regenerate the icon, run `cargo run -p prism-core --example make_ico`.
 |---|---|
 | `crates/prism-core` | Platform-neutral: annotation model with undo, rendering (tiny-skia), blur, pixelate, PNG, settings, file naming. No OS calls. |
 | `platforms/windows` | The Windows app: Win32 + GDI. Tray, hotkeys, capture, overlay editor, clipboard, Windows OCR, toast. |
+| `installer` | The setup wizard (Inno Setup), built by `scripts/package-windows.ps1`. |
 
 A macOS host would reuse `prism-core` as is. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
