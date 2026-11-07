@@ -90,6 +90,7 @@ To regenerate the icon, run `cargo run -p prism-core --example make_ico`.
 | `crates/prism-core` | Platform-neutral: annotation model with undo, rendering (tiny-skia), blur, pixelate, PNG, settings, file naming. No OS calls. |
 | `platforms/windows` | The Windows app: Win32 + GDI. Tray, hotkeys, capture, overlay editor, clipboard, Windows OCR, toast. |
 | `installer` | The setup wizard (Inno Setup), built by `scripts/package-windows.ps1`. |
+| `assets/fonts` | Geist, the interface font, built into the exe (SIL Open Font License; see `Geist-LICENSE.txt`). |
 
 A macOS host would reuse `prism-core` as is. See [docs/ROADMAP.md](docs/ROADMAP.md).
 

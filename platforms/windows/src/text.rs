@@ -18,22 +18,45 @@ use windows::core::PCWSTR;
 
 const FACE: &str = "Segoe UI";
 
-/// Windows 11's text face, made for reading at small sizes, or the older one where it's missing.
+/// Geist, the Bero Suite's typeface, built into the exe. It's the same file Spotlight ships:
+/// scaled up 3% so it sits as large as Inter did. See `assets/fonts/Geist-LICENSE.txt`.
+const GEIST: &[u8] = include_bytes!("../../../assets/fonts/GeistVariable.ttf");
+const GEIST_FACE: &str = "Geist";
+
+/// Makes Geist available to this process only: nothing is installed on the system.
+fn load_geist() -> bool {
+    use windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
+    let mut count = 0u32;
+    let handle = unsafe { AddFontMemResourceEx(GEIST.as_ptr() as *const _, GEIST.len() as u32, None, &mut count) };
+    !handle.is_invalid() && count > 0
+}
+
+/// The face GDI really gives for `wanted`: the same name if it has it, or its fallback.
+fn resolves_to(wanted: &'static str) -> bool {
+    let t = GdiText::with_face(wanted);
+    let font = t.font(12, FW_NORMAL.0);
+    let mut face = [0u16; 64];
+    let len = unsafe {
+        let old = SelectObject(t.dc, font.into());
+        let len = GetTextFaceW(t.dc, Some(&mut face));
+        SelectObject(t.dc, old);
+        len
+    };
+    String::from_utf16_lossy(&face[..(len.max(1) - 1) as usize]).eq_ignore_ascii_case(wanted)
+}
+
+/// Prism's typeface: Geist, or if it couldn't be loaded, Windows 11's text face, or the older one.
 pub fn ui_face() -> &'static str {
     static FOUND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     FOUND.get_or_init(|| {
         const NEW: &str = "Segoe UI Variable Text";
-        let t = GdiText::with_face(NEW);
-        let font = t.font(12, FW_NORMAL.0);
-        let mut face = [0u16; 64];
-        let len = unsafe {
-            let old = SelectObject(t.dc, font.into());
-            let len = GetTextFaceW(t.dc, Some(&mut face));
-            SelectObject(t.dc, old);
-            len
-        };
-        let found = String::from_utf16_lossy(&face[..(len.max(1) - 1) as usize]);
-        if found.eq_ignore_ascii_case(NEW) { NEW } else { FACE }
+        if load_geist() && resolves_to(GEIST_FACE) {
+            GEIST_FACE
+        } else if resolves_to(NEW) {
+            NEW
+        } else {
+            FACE
+        }
     })
 }
 
@@ -51,7 +74,7 @@ fn weight_of(bold: bool) -> u32 {
 
 impl GdiText {
     pub fn new() -> GdiText {
-        GdiText::with_face(FACE)
+        GdiText::with_face(ui_face())
     }
 
     pub fn with_face(face: &'static str) -> GdiText {
