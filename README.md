@@ -39,7 +39,7 @@ Change the shortcuts in Settings (right-click the tray icon, then Settings…): 
 
 Download **Prism-Setup-<version>.exe** from [Releases](https://github.com/Beroris/prism/releases/latest) and run it. It installs for you only, so it doesn't ask for admin rights, and adds Prism to the Start menu. Uninstall it from Settings → Apps like any other app; that also gives Print Screen back to Snipping Tool if Prism had it.
 
-To run Prism without installing, download the zip instead and start `prism.exe`.
+To run Prism without installing, download **Prism-<version>-Portable.exe** instead. Run it from anywhere, a USB stick included. It keeps its settings in a "Prism settings" folder beside itself rather than in your profile.
 
 From a clone of this repo, these build and install it for you only:
 
@@ -78,7 +78,7 @@ You need Rust 1.85 or newer.
 ```sh
 cargo build --release -p prism-windows        # target/release/prism.exe
 cargo test --workspace
-pwsh scripts/package-windows.ps1             # dist/: the installer, a zip and SHA256SUMS.txt (needs Inno Setup 6)
+pwsh scripts/package-windows.ps1             # dist/: the installer and the portable exe (needs Inno Setup 6)
 ```
 
 To regenerate the icon, run `cargo run -p prism-core --example make_ico`.
