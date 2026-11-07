@@ -37,7 +37,7 @@ Change the shortcuts in Settings (right-click the tray icon, then Settings…): 
 
 ## Install
 
-Download **Prism-Setup-<version>.exe** from [Releases](https://github.com/Beroris/prism/releases/latest) and run it. It installs for you only, so it doesn't ask for admin rights, and adds Prism to the Start menu. Uninstall it from Settings → Apps like any other app; that also gives Print Screen back to Snipping Tool if Prism had it.
+Download **Prism-<version>-Setup.exe** from [Releases](https://github.com/Beroris/prism/releases/latest) and run it. It installs for you only, so it doesn't ask for admin rights, and adds Prism to the Start menu. Uninstall it from Settings → Apps like any other app; that also gives Print Screen back to Snipping Tool if Prism had it.
 
 To run Prism without installing, download **Prism-<version>-Portable.exe** instead. Run it from anywhere, a USB stick included. It keeps its settings in a "Prism settings" folder beside itself rather than in your profile.
 

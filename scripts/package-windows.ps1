@@ -2,7 +2,7 @@
 #
 #   pwsh scripts/package-windows.ps1
 #
-#   dist/Prism-Setup-<version>.exe     the installer, which most people want
+#   dist/Prism-<version>-Setup.exe     the installer, which most people want
 #   dist/Prism-<version>-Portable.exe  runs from anywhere and keeps its settings beside itself
 #
 # The installer needs Inno Setup 6: winget install JRSoftware.InnoSetup
@@ -27,6 +27,6 @@ try {
     & $iscc /Q "/DAppVersion=$version" "/DSourceExe=$root\target\release\prism.exe" installer\prism.iss
     if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
 
-    Write-Host "wrote $(Join-Path $dist "Prism-Setup-$version.exe")"
+    Write-Host "wrote $(Join-Path $dist "Prism-$version-Setup.exe")"
     Write-Host "wrote $portable"
 } finally { Pop-Location }

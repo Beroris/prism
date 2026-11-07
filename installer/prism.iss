@@ -46,7 +46,7 @@ MinVersion=10.0.17763
 Compression=lzma2/max
 SolidCompression=yes
 OutputDir=..\dist
-OutputBaseFilename=Prism-Setup-{#AppVersion}
+OutputBaseFilename=Prism-{#AppVersion}-Setup
 ; Prism is closed by the code below, so Windows' "close these apps" page isn't needed.
 CloseApplications=no
 RestartApplications=no
