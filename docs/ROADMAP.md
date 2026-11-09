@@ -36,5 +36,3 @@ Done and checked end to end on one machine. The check opened the overlay with `-
 - an overlay NSWindow above everything, including the menu bar
 - Vision for OCR
 - NSPasteboard and a menu-bar item
-
-Orbit's macOS host is a model for the structure.

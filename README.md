@@ -50,7 +50,7 @@ pwsh scripts/install-windows.ps1 -Uninstall   # removes it (add -Purge to delete
 
 ## Running it from other tools
 
-Starting the exe again hands the command to the copy that's already running, which then opens the overlay in about 70 ms. That makes it easy to trigger from Orbit, a Stream Deck or a desktop shortcut:
+Starting the exe again hands the command to the copy that's already running, which then opens the overlay in about 70 ms. That makes it easy to trigger from a launcher, a Stream Deck or a desktop shortcut:
 
 ```
 prism.exe --region   # also the default with no argument

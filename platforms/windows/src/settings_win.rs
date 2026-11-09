@@ -1,4 +1,4 @@
-//! The settings window, in the look of Spotlight's: one page that scrolls under a header with
+//! The settings window: one page that scrolls under a header with
 //! tabs that follow it, sections of glass cards, rows that light up under the pointer, and
 //! controls that move. Everything is drawn here with tiny-skia, so it's sharp at any scale and
 //! can animate. Only the two text boxes are Windows' own, and only while one is being typed in.

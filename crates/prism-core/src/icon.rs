@@ -1,11 +1,10 @@
-//! The app icon, drawn in code so every size is crisp. Same family as Orbit's icon: a flat,
-//! full-bleed rounded square (violet-600 where Orbit is amber-600) with a bold white mark, here
-//! a camera aperture. Geometry is in a 64-unit box, like Orbit's generator.
+//! The app icon, drawn in code so every size is crisp: a flat, full-bleed violet rounded square
+//! with a bold white camera aperture. Geometry is in a 64-unit box.
 //! Used for the tray at runtime and to generate the `.ico` files (see `examples/make_ico.rs`).
 
 use tiny_skia::{FillRule, LineCap, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
-/// Tile colour: Tailwind violet-600, the counterpart of Orbit's amber-600 (#d97706).
+/// Tile colour: Tailwind violet-600 (#7c3aed).
 const TILE: (u8, u8, u8) = (0x7C, 0x3A, 0xED);
 
 /// Aperture blades in a 24-unit box centred on (12, 12) with the rim at radius 10: each is a
@@ -35,7 +34,7 @@ pub fn render_rgba(size: u32) -> Pixmap {
     let mut white = Paint::default();
     white.anti_alias = true;
     white.set_color_rgba8(255, 255, 255, 255);
-    // Ring: the same outer edge as Orbit's (radius 21.2), lighter so the blades have room.
+    // Ring: outer edge at radius 21.2, with a light stroke so the blades have room.
     let rim = 18.6;
     let mut pb = PathBuilder::new();
     pb.push_circle(c, c, rim * s);

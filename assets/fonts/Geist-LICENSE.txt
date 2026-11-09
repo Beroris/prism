@@ -92,6 +92,6 @@ DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
 ---
-Spotlight change: GeistVariable.ttf is Geist[wght].ttf from google/fonts with
+Change in this copy: GeistVariable.ttf is Geist[wght].ttf from google/fonts with
 head.unitsPerEm lowered from 1000 to 971 and nothing else changed. This scales
 the whole font up by 3% so its x-height matches Inter's at the same font size.

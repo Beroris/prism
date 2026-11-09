@@ -3,7 +3,7 @@
 //! `prism.exe [--region | --screen | --text | --settings | --quit] [--background]`
 //!
 //! One resident tray process. Starting the exe again forwards the command to it (no argument
-//! means a region capture), so other tools — Orbit, a Stream Deck, a shortcut — can trigger
+//! means a region capture), so other tools — a launcher, a Stream Deck, a shortcut — can trigger
 //! captures without a second process staying around.
 
 #![windows_subsystem = "windows"]
