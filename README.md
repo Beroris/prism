@@ -101,3 +101,7 @@ There's no network access, no account and no telemetry. Settings are in `%APPDAT
 ## Support
 
 Prism is free. If it saves you time, you can [support me on Ko-fi](https://ko-fi.com/beroris).
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE). The Geist font in `assets/fonts` keeps its own SIL Open Font License.
