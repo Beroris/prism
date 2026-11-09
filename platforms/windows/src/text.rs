@@ -18,7 +18,7 @@ use windows::core::PCWSTR;
 
 const FACE: &str = "Segoe UI";
 
-/// Geist, the Bero Suite's typeface, built into the exe. It's the same file Spotlight ships:
+/// Geist, the interface typeface, built into the exe. It's the same file Spotlight ships:
 /// scaled up 3% so it sits as large as Inter did. See `assets/fonts/Geist-LICENSE.txt`.
 const GEIST: &[u8] = include_bytes!("../../../assets/fonts/GeistVariable.ttf");
 const GEIST_FACE: &str = "Geist";

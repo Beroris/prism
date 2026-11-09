@@ -61,9 +61,6 @@ fn known_folder(id: &GUID, create: bool) -> Option<PathBuf> {
     }
 }
 
-/// The app's name before it became Prism; its settings are carried over once.
-const OLD_APP_NAME: &str = "BLS Screenshot";
-
 /// Whether this copy is the portable one: its file name says so, as in `Prism-1.0.0-Portable.exe`.
 pub fn is_portable() -> bool {
     std::env::current_exe().ok().and_then(|exe| exe.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase())).is_some_and(|stem| stem.contains("portable"))
@@ -71,8 +68,7 @@ pub fn is_portable() -> bool {
 
 /// Where settings live, created if needed. The portable copy keeps them in a "Prism settings"
 /// folder beside itself, so it leaves nothing in the user's profile. Otherwise it's
-/// `%APPDATA%\Prism`, and the first time that's created, settings from `%APPDATA%\BLS Screenshot`
-/// are copied across (the old folder is left alone).
+/// `%APPDATA%\Prism`.
 pub fn data_dir() -> PathBuf {
     if is_portable() {
         if let Some(beside) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|p| p.join(format!("{APP_NAME} settings")))) {
@@ -82,13 +78,6 @@ pub fn data_dir() -> PathBuf {
     }
     let base = known_folder(&FOLDERID_RoamingAppData, false).unwrap_or_else(std::env::temp_dir);
     let dir = base.join(APP_NAME);
-    if !dir.exists() {
-        let old = base.join(OLD_APP_NAME).join("settings.json");
-        let _ = std::fs::create_dir_all(&dir);
-        if old.is_file() {
-            let _ = std::fs::copy(&old, dir.join("settings.json"));
-        }
-    }
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

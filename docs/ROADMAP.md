@@ -23,7 +23,7 @@ Done and checked end to end on one machine. The check opened the overlay with `-
 - A small settings window, including a hotkey recorder, instead of editing JSON
 - Pin a capture to the screen (always-on-top floating image)
 - Repeat the last region
-- Edit an existing image file in the same editor (shared with the suite's image viewer)
+- Edit an existing image file in the same editor
 - Desktop Duplication capture for HDR monitors
 - A crop tool, an arrow style choice, and text with a background box
 - Scrolling capture
