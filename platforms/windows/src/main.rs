@@ -1,6 +1,6 @@
 //! Prism for Windows.
 //!
-//! `prism.exe [--region | --screen | --text | --settings | --quit] [--background]`
+//! `prism.exe [--region | --screen | --text | --settings | --welcome | --update | --quit] [--background]`
 //!
 //! One resident tray process. Starting the exe again forwards the command to it (no argument
 //! means a region capture), so other tools — a launcher, a Stream Deck, a shortcut — can trigger
@@ -21,6 +21,7 @@ mod text;
 mod toast;
 mod tray;
 mod ui;
+mod update;
 mod util;
 
 use app::{COPYDATA_TAG, Command, MAIN_CLASS};
@@ -42,6 +43,13 @@ fn main() {
         let script = args.get(i + 1).cloned().unwrap_or_default();
         let out = args.get(i + 2).cloned().unwrap_or_else(|| "overlay.png".into());
         std::process::exit(selftest_render(&script, &out));
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--preview-update-popup") {
+        // --preview-update-popup <out.png> [scale] : the offer to install an update, off-screen.
+        let out = args.get(i + 1).cloned().unwrap_or_else(|| "update.png".into());
+        let scale = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        std::process::exit(toast::preview_update(std::path::Path::new(&out), scale));
     }
 
     if let Some(i) = args.iter().position(|a| a == "--preview-settings") {
@@ -66,6 +74,9 @@ fn main() {
 
     let command = args.iter().find_map(|a| Command::parse(a));
     let background = args.iter().any(|a| a == "--background");
+    // After an update, the old version may still be on its way out: wait for it first, so this
+    // copy isn't taken for a second one.
+    let updated = update::finish_update(&args);
 
     // One instance. A second start forwards its command and exits.
     let mutex_name = wide("Local\\Prism.Instance");
@@ -84,7 +95,7 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
     let Some(hwnd) = app::create_window() else { return };
-    app::start(hwnd, command, background);
+    app::start(hwnd, command, background, updated);
 
     let mut msg = MSG::default();
     unsafe {

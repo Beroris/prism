@@ -5,7 +5,7 @@
 use crate::text::GdiText;
 use crate::ui;
 use crate::util::wide;
-use prism_core::{IRect, Image};
+use prism_core::{IRect, Image, Rgba};
 use prism_core::settings::PopupPosition;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IDC_HAND, KillTimer, LoadCursorW, RegisterClassExW, SW_SHOWNOACTIVATE, SetTimer,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, SetCursor, WM_SETCURSOR, RegisterClassExW, SW_SHOWNOACTIVATE, SetTimer,
     ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -30,6 +30,10 @@ pub enum Click {
     Reveal(PathBuf),
     /// Open with the default app.
     Open(PathBuf),
+    /// Install the downloaded update.
+    Install,
+    /// Just close.
+    Dismiss,
 }
 
 struct Live {
@@ -42,6 +46,10 @@ struct Live {
     alpha: u8,
     fading: bool,
     click: Click,
+    /// Where a click does something, in the window. Empty: anywhere does `click`.
+    buttons: Vec<(IRect, Click)>,
+    /// How long it stays when not pointed at.
+    life: u32,
 }
 
 impl Drop for Live {
@@ -221,7 +229,95 @@ pub fn show(title: &str, body: &str, thumb: Option<&Image>, near: Option<IRect>,
     // tiny-skia drew in "BGRA via swapped colours", so the buffer is already what Windows wants.
     let work = IRect::new(work.left, work.top, work.right - work.left, work.bottom - work.top);
     let (x, y) = place(POSITION.with(|p| p.get()), work, (w, h), margin, (16.0 * s) as i32);
-    let pos = POINT { x, y };
+    open_window(&pm, POINT { x, y }, (w, h), click, Vec::new(), LIFE_MS);
+}
+
+/// How long the offer to install an update stays when not pointed at.
+const OFFER_MS: u32 = 20_000;
+
+/// Offers to install the version just downloaded: Prism's icon, what's ready, and "Install
+/// now" and "Later". If it goes unanswered, the tray menu and Settings still have it.
+pub fn show_update(version: &str) {
+    close();
+    register();
+    let mon = crate::util::monitor_at(crate::util::cursor_pos());
+    let s = crate::util::monitor_scale(mon);
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe {
+        let _ = GetMonitorInfoW(mon, &mut mi);
+    }
+    let work = IRect::new(mi.rcWork.left, mi.rcWork.top, mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top);
+    let Some((pm, margin, buttons)) = draw_update(version, s) else { return };
+    let (w, h) = (pm.width() as i32, pm.height() as i32);
+    let (x, y) = place(POSITION.with(|p| p.get()), work, (w, h), margin, (16.0 * s).round() as i32);
+    open_window(&pm, POINT { x, y }, (w, h), Click::None, buttons, OFFER_MS);
+}
+
+/// The update offer at `s` times its size, with its shadow margin and its buttons.
+fn draw_update(version: &str, s: f32) -> Option<(Pixmap, i32, Vec<(IRect, Click)>)> {
+    let text = GdiText::new();
+    let px = |v: f32| (v * s).round() as i32;
+    let (margin, pad, icon) = (px(14.0), px(14.0), px(40.0));
+    let card_w = px(340.0);
+    let (title_px, body_px, button_px) = (13.5 * s, 12.0 * s, 12.5 * s);
+    let title = format!("{} {version} is ready", crate::util::APP_NAME);
+    let body = "Install it now? It takes a few seconds.";
+    let (_, th) = text.measure(&title, title_px, true);
+    let (_, bh) = text.measure(body, body_px, false);
+    let gap = px(3.0);
+    let button_h = px(28.0);
+    let top_h = icon.max(th + gap + bh);
+    let card_h = pad + top_h + px(12.0) + button_h + pad;
+    let (w, h) = (card_w + margin * 2, card_h + margin * 2);
+    let mut pm = Pixmap::new(w as u32, h as u32)?;
+    let card = IRect::new(margin, margin, card_w, card_h);
+    let later_w = text.measure("Later", button_px, true).0 + px(28.0);
+    let install_w = text.measure("Install now", button_px, true).0 + px(32.0);
+    let by = card.bottom() - pad - button_h;
+    let install = IRect::new(card.right() - pad - install_w, by, install_w, button_h);
+    let later = IRect::new(install.x - px(8.0) - later_w, by, later_w, button_h);
+    {
+        let mut m = pm.as_mut();
+        ui::panel(&mut m, card, 10.0 * s, s);
+        let text_x = card.x + pad + icon + px(12.0);
+        let ty = card.y + pad + (top_h - (th + gap + bh)) / 2;
+        ui::text(&mut m, &text, &title, title_px, true, text_x, ty, ui::FG);
+        ui::text(&mut m, &text, body, body_px, false, text_x, ty + th + gap, ui::FG_DIM);
+        let radius = button_h as f32 / 2.0;
+        ui::stroke_rrect(&mut m, later, radius, 1.0, ui::PANEL_BORDER);
+        ui::fill_rrect(&mut m, later, radius, Rgba { r: 0xFF, g: 0xFF, b: 0xFF, a: 0x10 });
+        ui::fill_rrect(&mut m, install, radius, Rgba::rgb(0x7C, 0x3A, 0xED));
+        for (r, label) in [(later, "Later"), (install, "Install now")] {
+            let (lw, lh) = text.measure(label, button_px, true);
+            ui::text(&mut m, &text, label, button_px, true, r.x + (r.w - lw) / 2, r.y + (r.h - lh) / 2, ui::FG);
+        }
+    }
+    // The icon is drawn RGBA; this canvas is BGRA.
+    let mut logo = prism_core::icon::render_rgba(icon as u32);
+    logo.data_mut().chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+    pm.draw_pixmap(card.x + pad, card.y + pad + (top_h - icon) / 2, logo.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+
+    // Generous edges, so a click just off a button still counts.
+    let buttons = vec![(install.inflate(px(3.0)), Click::Install), (later.inflate(px(3.0)), Click::Dismiss)];
+    Some((pm, margin, buttons))
+}
+
+/// The update offer as a PNG, on a backdrop, for checking how it looks.
+pub fn preview_update(out: &std::path::Path, scale: f32) -> i32 {
+    let Some((popup, _, _)) = draw_update("1.1.0", scale) else { return 3 };
+    let Some(mut pm) = Pixmap::new(popup.width() + 40, popup.height() + 40) else { return 3 };
+    pm.fill(tiny_skia::Color::from_rgba8(0x60, 0x60, 0x66, 0xFF));
+    pm.draw_pixmap(20, 20, popup.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    let Some(image) = Image::from_bgra(pm.width(), pm.height(), pm.take()) else { return 6 };
+    match prism_core::image::encode_png(&image).map(|png| std::fs::write(out, png)) {
+        Ok(Ok(())) => 0,
+        _ => 7,
+    }
+}
+
+/// Puts a drawn toast on the screen. `buttons` are where a click does something, in the window;
+/// with none, a click anywhere does `click`.
+fn open_window(pm: &Pixmap, pos: POINT, (w, h): (i32, i32), click: Click, buttons: Vec<(IRect, Click)>, life: u32) {
     unsafe {
         let class = wide(CLASS);
         let Ok(hwnd) = CreateWindowExW(
@@ -261,12 +357,20 @@ pub fn show(title: &str, body: &str, thumb: Option<&Image>, near: Option<IRect>,
         };
         std::ptr::copy_nonoverlapping(pm.data().as_ptr(), bits as *mut u8, pm.data().len());
         let old = SelectObject(dc, bmp.into());
-        let live = Live { hwnd, dc, bmp, old, pos, size: SIZE { cx: w, cy: h }, alpha: 255, fading: false, click };
+        let live = Live { hwnd, dc, bmp, old, pos, size: SIZE { cx: w, cy: h }, alpha: 255, fading: false, click, buttons, life };
         present(&live);
         LIVE.with(|l| *l.borrow_mut() = Some(live));
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        SetTimer(Some(hwnd), LIFE_TIMER, LIFE_MS, None);
+        SetTimer(Some(hwnd), LIFE_TIMER, life, None);
     }
+}
+
+/// What a click at `at`, in the window, does: with buttons, only on one of them.
+fn clicked(l: &Live, (x, y): (i32, i32)) -> Option<Click> {
+    if l.buttons.is_empty() {
+        return Some(l.click.clone());
+    }
+    l.buttons.iter().find(|(r, _)| x >= r.x && x < r.right() && y >= r.y && y < r.bottom()).map(|(_, c)| c.clone())
 }
 
 fn present(l: &Live) {
@@ -326,18 +430,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         }
                     }
                 });
-                SetTimer(Some(hwnd), LIFE_TIMER, LIFE_MS, None);
+                let life = LIVE.with(|l| l.borrow().as_ref().map_or(LIFE_MS, |l| l.life));
+                SetTimer(Some(hwnd), LIFE_TIMER, life, None);
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                let click = LIVE.with(|l| l.borrow().as_ref().map(|l| l.click.clone()));
+                let at = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
+                let Some(click) = LIVE.with(|l| l.borrow().as_ref().and_then(|l| clicked(l, at))) else { return LRESULT(0) };
                 close();
-                match click {
+                match Some(click) {
                     Some(Click::Reveal(p)) => crate::util::reveal_in_explorer(&p),
                     Some(Click::Open(p)) => crate::util::shell_open(&p),
+                    Some(Click::Install) => crate::update::install(),
                     _ => {}
                 }
                 LRESULT(0)
+            }
+            WM_SETCURSOR => {
+                // A hand only where a click does something.
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let over = LIVE.with(|l| l.borrow().as_ref().map(|l| clicked(l, (p.x - l.pos.x, p.y - l.pos.y)).is_some()));
+                let cursor = if over == Some(false) { IDC_ARROW } else { IDC_HAND };
+                SetCursor(LoadCursorW(None, cursor).ok());
+                LRESULT(1)
             }
             WM_RBUTTONUP => {
                 close();

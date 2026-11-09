@@ -30,8 +30,18 @@ pub fn virtual_screen() -> IRect {
     }
 }
 
+/// A small grab for the live magnifier, taken on every mouse move. It leaves out `CAPTUREBLT`,
+/// which can make the pointer flicker when used that often.
+pub fn grab_quick(area: IRect) -> Option<Image> {
+    grab_with(area, false, false)
+}
+
 /// Copy `area` (screen coordinates) into a BGRA image. Pixels are made opaque.
 pub fn grab(area: IRect, with_cursor: bool) -> Option<Image> {
+    grab_with(area, with_cursor, true)
+}
+
+fn grab_with(area: IRect, with_cursor: bool, layered: bool) -> Option<Image> {
     if area.is_empty() {
         return None;
     }
@@ -57,7 +67,7 @@ pub fn grab(area: IRect, with_cursor: bool) -> Option<Image> {
             return None;
         };
         let old = SelectObject(mem, dib.into());
-        let ok = BitBlt(mem, 0, 0, area.w, area.h, Some(screen), area.x, area.y, SRCCOPY | CAPTUREBLT).is_ok();
+        let ok = BitBlt(mem, 0, 0, area.w, area.h, Some(screen), area.x, area.y, if layered { SRCCOPY | CAPTUREBLT } else { SRCCOPY }).is_ok();
         if ok && with_cursor {
             draw_cursor(mem, area.x, area.y);
         }

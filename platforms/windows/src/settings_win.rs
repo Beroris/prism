@@ -18,18 +18,18 @@ use crate::text::{GdiText, ui_face};
 use crate::ui::{self, Btn, IconExtra};
 use crate::util::wide;
 use prism_core::doc::{Tool, ToolKeys, WIDTHS};
-use prism_core::icon::rounded_rect;
+use prism_core::icon::{render_turned, rounded_rect};
 use prism_core::render::{blend_mask, paint_color};
-use prism_core::settings::{EnterAction, FinishKey, Hotkeys, Loaded, PopupPosition, QuickFinish, Settings};
+use prism_core::settings::{EnterAction, FinishKey, Hotkeys, Loaded, PopupPosition, QuickFinish, Settings, ToolbarPlace};
 use prism_core::{IRect, Rgba, naming};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
-use tiny_skia::{FillRule, LineCap, Paint, PathBuilder, PixmapMut, Stroke, Transform};
+use tiny_skia::{FillRule, LineCap, Paint, PathBuilder, PixmapMut, PixmapPaint, Stroke, Transform};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmExtendFrameIntoClientArea, DwmFlush, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection,
@@ -77,14 +77,18 @@ const TEXT_TIMER: usize = 2;
 const SAVED_TIMER: usize = 3;
 const BAR_TIMER: usize = 4;
 const FRAME_MS: u32 = 15;
+/// How fast a scroll glides to where it's headed: about 70 ms to cover two thirds of the way.
+const SCROLL_RATE: f32 = 14.0;
 const TEXT_SAVE_DELAY_MS: u32 = 500;
 const SAVED_MS: u32 = 1800;
 const BAR_IDLE_MS: u32 = 900;
 
-const SHORTCUTS: [(&str, &str); 3] = [
+const SHORTCUTS: [(&str, &str); 5] = [
     ("Capture a region", "Drag to select, or click a window."),
     ("Capture the screen", "The whole screen under the pointer, straight away."),
     ("Copy text from the screen", "Select a region and the text in it is copied."),
+    ("Capture the last region again", "The same part of the screen as last time, copied or saved straight away."),
+    ("Mark up the last region again", "The same part of the screen as last time, chosen and ready to draw on."),
 ];
 const RECORDING_NOTE: &str = "Press the keys you want, or Esc to leave it as it was.";
 const SHORTCUTS_NOTE: &str = "Click a shortcut and press new keys. While it listens, Backspace puts back the default and Delete turns it off.";
@@ -94,11 +98,23 @@ const SNIPPING_ON: &str = "These capture a region with Prism instead of opening 
 const SNIPPING_OFF: &str = "Snipping Tool has these. Turn this on and they capture a region with Prism instead.";
 const SNIPPING_FAILED: &str = "Couldn't take Win+Shift+S from Snipping Tool, so only Print Screen opens Prism. Try turning this off and on again.";
 /// The keys Replace Snipping Tool brings, as their key caps show them.
-const SNIPPING_KEYS: [&str; 2] = ["PrintScreen", "Win+Shift+S"];
+const SNIPPING_KEYS: [&str; 2] = ["Win+Shift+S", "PrintScreen"];
 const QUICK: [(&str, QuickFinish); 5] =
     [("Off", QuickFinish::Off), ("Shift", QuickFinish::Shift), ("Ctrl", QuickFinish::Ctrl), ("Alt", QuickFinish::Alt), ("Always", QuickFinish::Always)];
 const FINISH_KEYS: [(&str, FinishKey); 3] = [("Enter", FinishKey::Enter), ("Esc", FinishKey::Escape), ("Both", FinishKey::Both)];
 const ENTER: [(&str, EnterAction); 3] = [("Copy", EnterAction::Copy), ("Save", EnterAction::Save), ("Both", EnterAction::CopyAndSave)];
+/// The toolbar picker's spots, in the order `bar_spots` lays them out.
+const TOOLBAR_PLACES: [(&str, ToolbarPlace); 8] = [
+    ("Above the region, at its left end.", ToolbarPlace::AboveLeft),
+    ("Above the region, in the middle.", ToolbarPlace::AboveCenter),
+    ("Above the region, at its right end.", ToolbarPlace::AboveRight),
+    ("Standing up along the region's left side.", ToolbarPlace::Left),
+    ("Standing up along the region's right side.", ToolbarPlace::Right),
+    ("Below the region, at its left end.", ToolbarPlace::BelowLeft),
+    ("Below the region, in the middle.", ToolbarPlace::BelowCenter),
+    ("Below the region, at its right end.", ToolbarPlace::BelowRight),
+];
+
 const POPUP_POSITIONS: [(&str, PopupPosition); 6] = [
     ("Top left", PopupPosition::TopLeft),
     ("Top centre", PopupPosition::TopCenter),
@@ -113,7 +129,9 @@ fn shortcut(keys: &Hotkeys, slot: usize) -> &str {
     match slot {
         0 => &keys.region,
         1 => &keys.screen,
-        _ => &keys.text,
+        2 => &keys.text,
+        3 => &keys.last,
+        _ => &keys.last_markup,
     }
 }
 
@@ -121,7 +139,9 @@ fn set_shortcut(keys: &mut Hotkeys, slot: usize, text: &str) {
     let field = match slot {
         0 => &mut keys.region,
         1 => &mut keys.screen,
-        _ => &mut keys.text,
+        2 => &mut keys.text,
+        3 => &mut keys.last,
+        _ => &mut keys.last_markup,
     };
     *field = text.to_string();
 }
@@ -263,6 +283,7 @@ impl Palette {
 
     fn tone(&self, tone: Tone) -> Rgba {
         match tone {
+            Tone::Text => self.text,
             Tone::Subtle => self.subtle,
             Tone::Muted => self.muted,
             Tone::Accent => self.accent,
@@ -343,6 +364,8 @@ enum Key {
     Divider,
     Saved,
     Bar,
+    /// The welcome's page sliding in.
+    Page,
 }
 
 #[derive(Clone, Copy)]
@@ -438,11 +461,18 @@ enum Ctl {
     Tab,
     Minimize,
     Close,
+    /// The welcome's buttons at the foot.
+    Back,
+    Next,
     Autostart,
+    CheckUpdates,
+    /// Check for, install or fetch a new version, as the update has got to.
+    Update,
     Snipping,
     Recorder(usize),
     ToolKey(usize),
     ResetToolKeys,
+    LiveCapture,
     Magnifier,
     Cursor,
     QuickFinish,
@@ -454,6 +484,7 @@ enum Ctl {
     SaveCopies,
     Notify,
     PopupPosition,
+    ToolbarPlace,
     Folder,
     Browse,
     OpenFolder,
@@ -469,6 +500,7 @@ enum Field {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tone {
+    Text,
     Subtle,
     Muted,
     Accent,
@@ -490,10 +522,14 @@ enum Kind {
     Toggle(bool),
     Segments { segs: Vec<Seg>, selected: usize, seg_w: i32 },
     Button { label: &'static str, ghost: bool },
+    /// The one button that moves things on, in the accent colour.
+    Primary { label: &'static str },
     Recorder(usize),
     ToolKey(usize),
     Field(Field),
     Picker(usize),
+    /// Where the editing toolbar goes around the region; the spot chosen.
+    BarPicker(usize),
 }
 
 #[derive(Clone)]
@@ -526,6 +562,7 @@ struct Note {
     y: i32,
     lines: Vec<String>,
     tone: Tone,
+    font: Font,
 }
 
 struct Heading {
@@ -544,6 +581,9 @@ struct Scene {
     notes: Vec<Note>,
     /// Where each tab's sections start, in page coordinates.
     tab_tops: [i32; 4],
+    /// A shortcut drawn large across the page, from this height, with others that do the same
+    /// small under it: the welcome shows the capture keys.
+    big_caps: Option<(String, Vec<String>, i32)>,
 }
 
 // --- State ------------------------------------------------------------------------------------
@@ -617,6 +657,8 @@ struct State {
     anims: Anims,
     scroll: f32,
     scroll_to: f32,
+    /// When the scroll last moved, so it glides by the time that passed, however late a frame.
+    scroll_frame: Option<Instant>,
     /// A tab clicked stays the current one until the page is scrolled some other way, as the
     /// last section may be too short to reach the top.
     pinned_tab: Option<usize>,
@@ -634,7 +676,7 @@ struct State {
     held: String,
     /// The keys that just finished a recording are still down: their typing and release are ignored.
     swallow_keys: bool,
-    slot_notes: [Option<String>; 3],
+    slot_notes: [Option<String>; 5],
     /// Why Print Screen couldn't be taken, when Replace Snipping Tool is on.
     print_screen_problem: Option<String>,
     tool_listening: Option<usize>,
@@ -647,10 +689,25 @@ struct State {
     edit_font: HFONT,
     edit_brush: HBRUSH,
     preview: bool,
+    /// This window is the welcome rather than Settings.
+    welcome: Option<Welcome>,
+    /// The canvas's size, kept for while it's lent out to be drawn on.
+    canvas_size: (i32, i32),
+}
+
+/// Where the welcome is up to.
+struct Welcome {
+    page: usize,
+    /// Which way the last page change went, so the new page slides in from that side.
+    forward: bool,
+    opened: Instant,
+    /// Close by starting a capture, from the last page's button.
+    capture_after: bool,
 }
 
 thread_local! {
     static CURRENT: Cell<Option<HWND>> = const { Cell::new(None) };
+    static CURRENT_WELCOME: Cell<Option<HWND>> = const { Cell::new(None) };
 }
 
 fn state(hwnd: HWND) -> Option<&'static mut State> {
@@ -664,11 +721,23 @@ impl State {
     }
 
     fn size(&self) -> (i32, i32) {
-        self.canvas.as_ref().map(|c| (c.w, c.h)).unwrap_or((self.px(WIDTH), self.px(HEIGHT)))
+        self.canvas.as_ref().map(|c| (c.w, c.h)).unwrap_or(self.canvas_size)
     }
 
     fn header_h(&self) -> i32 {
-        self.px(HEADER_H)
+        // The welcome has no header: its page is laid out where it's drawn.
+        if self.welcome.is_some() { 0 } else { self.px(HEADER_H) }
+    }
+
+    /// How far the welcome's page is pushed sideways as it slides in: anything above the foot.
+    fn page_dx(&self, y: i32) -> i32 {
+        let Some(w) = &self.welcome else { return 0 };
+        if y >= footer_top(self) {
+            return 0;
+        }
+        // No page change yet: nothing is sliding.
+        let left = 1.0 - self.anims.map.get(&Key::Page).map_or(1.0, |a| a.value);
+        (left * self.px(26.0) as f32 * if w.forward { 1.0 } else { -1.0 }).round() as i32
     }
 
     fn view_h(&self) -> i32 {
@@ -681,7 +750,7 @@ impl State {
 
     /// A page rectangle where it is in the window now.
     fn on_screen(&self, r: IRect) -> IRect {
-        r.offset(0, self.header_h() - self.scroll.round() as i32)
+        r.offset(self.page_dx(r.y), self.header_h() - self.scroll.round() as i32)
     }
 
     fn invalidate(&self) {
@@ -808,6 +877,20 @@ impl Layout<'_> {
         self.y += self.px(CARD_PAD);
     }
 
+    /// A card with no heading over it.
+    fn card(&mut self) {
+        self.card_top = self.y;
+        self.y += self.px(CARD_PAD);
+    }
+
+    /// Lines of text across the page, then `gap` below them.
+    fn text(&mut self, text: &str, font: Font, tone: Tone, gap: f32) {
+        let lines = self.s.wrap(text, font, self.w);
+        let line_h = self.s.line_h(font);
+        self.scene.notes.push(Note { x: self.x, y: self.y, lines: lines.clone(), tone, font });
+        self.y += line_h * lines.len() as i32 + self.px(gap);
+    }
+
     fn end_section(&mut self) {
         self.y += self.px(CARD_PAD) - self.px(1.0);
         self.scene.cards.push(IRect::new(self.x, self.card_top, self.w, self.y - self.card_top));
@@ -820,7 +903,7 @@ impl Layout<'_> {
         let x = self.x + self.px(6.0);
         let lines = self.s.wrap(text, SMALL, self.w - self.px(12.0));
         let line_h = self.s.line_h(SMALL);
-        self.scene.notes.push(Note { x, y: self.y, lines: lines.clone(), tone });
+        self.scene.notes.push(Note { x, y: self.y, lines: lines.clone(), tone, font: SMALL });
         self.y += line_h * lines.len() as i32 + self.px(SECTION_GAP);
     }
 
@@ -896,6 +979,9 @@ impl Layout<'_> {
 }
 
 fn layout(s: &State) -> Scene {
+    if let Some(w) = &s.welcome {
+        return welcome_layout(s, w.page);
+    }
     let (width, _) = s.size();
     let mut l = Layout { s, scene: Scene::default(), y: s.px(14.0), x: s.px(MARGIN), w: width - 2 * s.px(MARGIN), card_top: 0, reserve: Vec::new(), caps: Vec::new() };
     let set = &s.settings;
@@ -903,28 +989,14 @@ fn layout(s: &State) -> Scene {
     // General
     l.section("General", Some(0));
     l.toggle(&format!("Start {} when I sign in", crate::util::APP_NAME), "It waits quietly in the tray.", Tone::Subtle, Ctl::Autostart, s.autostart);
+    update_rows(&mut l);
     l.end_section();
 
     // Shortcuts: Windows' own capture keys first, then Prism's.
     l.section("Shortcuts", Some(1));
-    let (snip, snip_tone) = match (&s.print_screen_problem, s.snipping_failed, set.replace_snipping) {
-        (Some(problem), _, true) => (problem.clone(), Tone::Warning),
-        (_, true, true) => (SNIPPING_FAILED.to_string(), Tone::Warning),
-        (_, _, true) => (SNIPPING_ON.to_string(), Tone::Subtle),
-        _ => (SNIPPING_OFF.to_string(), Tone::Subtle),
-    };
-    l.caps = SNIPPING_KEYS.iter().map(|k| k.to_string()).collect();
-    l.toggle("Replace Snipping Tool", &snip, snip_tone, Ctl::Snipping, set.replace_snipping);
-    for (slot, (label, about)) in SHORTCUTS.iter().enumerate() {
-        let (desc, tone) = if s.recording == Some(slot) {
-            (RECORDING_NOTE.to_string(), Tone::Accent)
-        } else if let Some(problem) = &s.slot_notes[slot] {
-            (problem.clone(), Tone::Warning)
-        } else {
-            (about.to_string(), Tone::Subtle)
-        };
-        let (w, h) = (s.px(250.0), s.px(CONTROL_H));
-        l.row(label, &desc, tone, Some((Ctl::Recorder(slot), Kind::Recorder(slot), w, h)), false);
+    snipping_row(&mut l);
+    for slot in 0..SHORTCUTS.len() {
+        shortcut_row(&mut l, slot);
     }
     l.end_section();
     l.note(SHORTCUTS_NOTE, Tone::Muted);
@@ -977,6 +1049,7 @@ fn layout(s: &State) -> Scene {
 
     // Capturing
     l.section("While you select", Some(2));
+    l.toggle(LIVE_LABEL, LIVE_DESC, Tone::Subtle, Ctl::LiveCapture, set.live_capture);
     l.toggle("Show the magnifier", "A close-up of the pixels under the pointer, with their colour. Press C to copy the colour.", Tone::Subtle, Ctl::Magnifier, set.magnifier);
     l.toggle("Include the mouse pointer", "In region and screen captures.", Tone::Subtle, Ctl::Cursor, set.capture_cursor);
     l.end_section();
@@ -992,15 +1065,14 @@ fn layout(s: &State) -> Scene {
     };
     l.reserve = (0..Tool::ALL.len()).map(tool_desc).collect();
     l.segments("Pick up a tool", &tool_desc(shown), Ctl::AutoTool, Tool::ALL.iter().map(|t| Seg::Icon(*t)).collect(), chosen, 31.0);
+    toolbar_row(&mut l);
     l.end_section();
 
     l.section("When you're done", None);
     let finish = FINISH_KEYS.iter().position(|(_, k)| *k == set.finish_key).unwrap_or(0);
     l.reserve = (0..FINISH_KEYS.len()).map(|i| finish_desc(i).to_string()).collect();
     l.segments("Finish with", finish_desc(finish), Ctl::FinishKey, FINISH_KEYS.iter().map(|(n, _)| Seg::Text(n)).collect(), finish, 64.0);
-    let enter = ENTER.iter().position(|(_, a)| *a == set.enter_action).unwrap_or(0);
-    l.reserve = (0..ENTER.len()).map(|i| enter_desc(i).to_string()).collect();
-    l.segments("Finishing does", enter_desc(enter), Ctl::EnterAction, ENTER.iter().map(|(n, _)| Seg::Text(n)).collect(), enter, 64.0);
+    enter_row(&mut l);
     l.toggle("Also save what you copy", "Copied captures go to your folder too, so nothing is lost.", Tone::Subtle, Ctl::SaveCopies, set.save_copies);
     l.end_section();
 
@@ -1078,10 +1150,354 @@ fn layout(s: &State) -> Scene {
 
     l.y += s.px(4.0);
     let footer = format!("{} {} \u{00B7} Changes save as you make them", crate::util::APP_NAME, env!("CARGO_PKG_VERSION"));
-    l.scene.notes.push(Note { x: -1, y: l.y, lines: vec![footer], tone: Tone::Muted });
+    l.scene.notes.push(Note { x: -1, y: l.y, lines: vec![footer], tone: Tone::Muted, font: SMALL });
     l.y += s.line_h(SMALL) + s.px(28.0);
     l.scene.height = l.y;
     l.scene
+}
+
+/// Updates: the switch for looking by itself, and where an update has got to, with what to do
+/// next on the right.
+fn update_rows(l: &mut Layout) {
+    use crate::update::Phase;
+    let s = l.s;
+    l.toggle(
+        "Check for updates",
+        "Shortly after Prism starts, and once a day. A new version downloads in the background, then asks before it installs.",
+        Tone::Subtle,
+        Ctl::CheckUpdates,
+        s.settings.check_updates,
+    );
+    let phase = PREVIEW_UPDATE.with(|p| p.borrow().clone()).unwrap_or_else(|| if s.preview { Phase::Idle } else { crate::update::phase() });
+    let button = |label: &'static str| Kind::Button { label, ghost: false };
+    let ready = |v: &str| format!("Prism {v} is ready. Installing takes a few seconds, then Prism opens again.");
+    let (desc, tone, kind) = match &phase {
+        Phase::Idle => ("Look for a newer version now.".to_string(), Tone::Subtle, button("Check now")),
+        Phase::Checking => ("Looking for a newer version\u{2026}".to_string(), Tone::Subtle, button("Checking\u{2026}")),
+        Phase::UpToDate => ("You have the latest version.".to_string(), Tone::Subtle, button("Check now")),
+        Phase::Downloading(v) => (format!("Downloading Prism {v}\u{2026}"), Tone::Accent, button("Downloading\u{2026}")),
+        Phase::Ready(v) => (ready(v), Tone::Accent, Kind::Primary { label: "Install now" }),
+        Phase::Available(v) => (format!("Prism {v} is out. This copy can't update itself, so get it from GitHub."), Tone::Accent, button("Get it")),
+        Phase::Installing => ("Installing\u{2026}".to_string(), Tone::Accent, button("Installing\u{2026}")),
+        Phase::Failed(e) => (e.clone(), Tone::Warning, button("Try again")),
+    };
+    // As wide as the widest it can say, so it doesn't jump as the update moves on.
+    let w = ["Downloading\u{2026}", "Install now", "Check now"].iter().map(|t| s.measure(t, STRONG).0).max().unwrap_or(0) + s.px(36.0);
+    l.reserve = vec![ready("10.10.10")];
+    l.row(&format!("Prism {}", env!("CARGO_PKG_VERSION")), &desc, tone, Some((Ctl::Update, kind, w, s.px(CONTROL_H))), false);
+}
+
+thread_local! {
+    /// Where the update has got to, as a preview shows it.
+    static PREVIEW_UPDATE: std::cell::RefCell<Option<crate::update::Phase>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The update has moved on: Settings shows it.
+pub fn refresh() {
+    if let Some(hwnd) = CURRENT.with(|c| c.get()) {
+        if let Some(s) = state(hwnd) {
+            s.restage();
+        }
+    }
+}
+
+/// Replace Snipping Tool, with its keys and what it's doing now.
+fn snipping_row(l: &mut Layout) {
+    let s = l.s;
+    let (snip, snip_tone) = match (&s.print_screen_problem, s.snipping_failed, s.settings.replace_snipping) {
+        (Some(problem), _, true) => (problem.clone(), Tone::Warning),
+        (_, true, true) => (SNIPPING_FAILED.to_string(), Tone::Warning),
+        (_, _, true) => (SNIPPING_ON.to_string(), Tone::Subtle),
+        _ => (SNIPPING_OFF.to_string(), Tone::Subtle),
+    };
+    l.caps = SNIPPING_KEYS.iter().map(|k| k.to_string()).collect();
+    l.toggle("Replace Snipping Tool", &snip, snip_tone, Ctl::Snipping, s.settings.replace_snipping);
+}
+
+/// One of Prism's shortcuts, recorded by clicking it and pressing keys.
+fn shortcut_row(l: &mut Layout, slot: usize) {
+    let s = l.s;
+    let (label, about) = SHORTCUTS[slot];
+    let (desc, tone) = if s.recording == Some(slot) {
+        (RECORDING_NOTE.to_string(), Tone::Accent)
+    } else if let Some(problem) = &s.slot_notes[slot] {
+        (problem.clone(), Tone::Warning)
+    } else {
+        (about.to_string(), Tone::Subtle)
+    };
+    let (w, h) = (s.px(250.0), s.px(CONTROL_H));
+    l.row(label, &desc, tone, Some((Ctl::Recorder(slot), Kind::Recorder(slot), w, h)), false);
+}
+
+/// "Where the toolbar goes", with the spot pointed at described.
+fn toolbar_row(l: &mut Layout) {
+    let s = l.s;
+    let place = TOOLBAR_PLACES.iter().position(|(_, p)| *p == s.settings.toolbar_place).unwrap_or(7);
+    let shown = match s.hover {
+        Some((Ctl::ToolbarPlace, part)) => part,
+        _ => place,
+    };
+    l.reserve = (0..TOOLBAR_PLACES.len()).map(toolbar_desc).collect();
+    l.row("Where the toolbar goes", &toolbar_desc(shown), Tone::Subtle, Some((Ctl::ToolbarPlace, Kind::BarPicker(place), s.px(84.0), s.px(60.0))), false);
+}
+
+fn enter_row(l: &mut Layout) {
+    let enter = ENTER.iter().position(|(_, a)| *a == l.s.settings.enter_action).unwrap_or(0);
+    l.reserve = (0..ENTER.len()).map(|i| enter_desc(i).to_string()).collect();
+    l.segments("Finishing does", enter_desc(enter), Ctl::EnterAction, ENTER.iter().map(|(n, _)| Seg::Text(n)).collect(), enter, 64.0);
+}
+
+const LIVE_LABEL: &str = "Keep the screen live while you select";
+const LIVE_DESC: &str = "Videos and animations keep playing, and the screen is captured as you let go. Off, it freezes the moment you press the shortcut.";
+
+// --- The welcome ------------------------------------------------------------------------------
+//
+// Orbit's Setup look: a rail on the left with the logo and the steps, one page at a time on the
+// right, and Back and Next at the foot. It's Settings underneath, so its switches, choices and
+// shortcut fields are the same ones, and save the same way.
+
+const WELCOME_STEPS: [&str; 4] = ["Welcome", "Shortcut", "Capturing", "Done"];
+const WELCOME_W: f32 = 820.0;
+const WELCOME_H: f32 = 580.0;
+const RAIL_W: f32 = 236.0;
+const SIDE: f32 = 44.0;
+const PAGE_TOP: f32 = 44.0;
+const FOOTER_H: f32 = 70.0;
+const LOGO: f32 = 64.0;
+const BUTTON_W: f32 = 128.0;
+const LOGO_MS: f32 = 1100.0;
+
+const BIG_CAP_H: f32 = 52.0;
+
+fn rail_w(s: &State) -> i32 {
+    s.px(RAIL_W)
+}
+
+fn footer_top(s: &State) -> i32 {
+    s.size().1 - s.px(FOOTER_H)
+}
+
+fn content_x(s: &State) -> i32 {
+    rail_w(s) + s.px(SIDE)
+}
+
+fn content_w(s: &State) -> i32 {
+    s.size().0 - content_x(s) - s.px(SIDE)
+}
+
+/// A shortcut as it reads in a sentence.
+fn spoken(keys: &str) -> String {
+    keys.replace("PrintScreen", "Print Screen")
+}
+
+/// The keys that capture a region: the main one, to show large, and the others that do the same.
+fn capture_keys(s: &State) -> (String, Vec<String>) {
+    let mut keys = app::region_key_list(&s.settings);
+    if keys.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let main = keys.remove(0);
+    (main, keys)
+}
+
+fn welcome_layout(s: &State, page: usize) -> Scene {
+    let mut l = Layout { s, scene: Scene::default(), y: s.px(PAGE_TOP), x: content_x(s), w: content_w(s), card_top: 0, reserve: Vec::new(), caps: Vec::new() };
+    let title_gap = 6.0;
+    match page {
+        0 => {
+            l.text(&format!("Welcome to {}", crate::util::APP_NAME), TITLE, Tone::Text, title_gap);
+            l.text("Capture the screen, mark it up right where you took it, and copy or save it with one key.", BODY, Tone::Subtle, 22.0);
+            l.card();
+            l.row("Choose what to capture", "Drag over a region, or click a window. F takes the whole screen.", Tone::Subtle, None, false);
+            l.row("Mark it up in place", "Arrows, boxes, text, numbered steps and blur, from the toolbar beside it.", Tone::Subtle, None, false);
+            l.row("Kept on this PC", "No account and nothing sent anywhere. Captures go only where you copy or save them.", Tone::Subtle, None, false);
+            l.end_section();
+        }
+        1 => {
+            l.text("Your shortcut", TITLE, Tone::Text, title_gap);
+            l.text("Press it anywhere, in any app, to capture a region or a window.", BODY, Tone::Subtle, 18.0);
+            let (keys, others) = capture_keys(s);
+            if !keys.is_empty() {
+                let h = big_caps_h(s, &others);
+                l.scene.big_caps = Some((keys, others, l.y));
+                l.y += h + s.px(22.0);
+            }
+            l.card();
+            snipping_row(&mut l);
+            shortcut_row(&mut l, 0);
+            l.end_section();
+            l.note("The other shortcuts, for the whole screen, copying text and the last region, are in Settings, under Shortcuts.", Tone::Muted);
+        }
+        2 => {
+            l.text("How you like to capture", TITLE, Tone::Text, title_gap);
+            l.text("Change any of these later in Settings.", BODY, Tone::Subtle, 18.0);
+            l.card();
+            enter_row(&mut l);
+            l.toggle(LIVE_LABEL, LIVE_DESC, Tone::Subtle, Ctl::LiveCapture, s.settings.live_capture);
+            toolbar_row(&mut l);
+            l.toggle(&format!("Start {} when I sign in", crate::util::APP_NAME), "It waits quietly in the tray.", Tone::Subtle, Ctl::Autostart, s.autostart);
+            l.end_section();
+        }
+        _ => {
+            l.text("You're all set", TITLE, Tone::Text, title_gap);
+            let (keys, others) = capture_keys(s);
+            let how = if keys.is_empty() { "Click Prism's icon in the tray to capture.".to_string() } else { format!("Press {} to capture.", spoken(&keys)) };
+            l.text(&format!("{how} {} waits in the tray: click its icon to capture too, or right-click it for Settings.", crate::util::APP_NAME), BODY, Tone::Subtle, 22.0);
+            if !keys.is_empty() {
+                let h = big_caps_h(s, &others);
+                l.scene.big_caps = Some((keys, others, l.y));
+                l.y += h + s.px(26.0);
+            }
+            l.card();
+            l.row("Once you've chosen a region", "Draw on it if you like, then press Enter to copy or save it, as you chose. Esc closes without capturing.", Tone::Subtle, None, false);
+            l.end_section();
+        }
+    }
+    // The foot: Back, and the button that moves on.
+    let (w, h) = (s.px(BUTTON_W), s.px(34.0));
+    let y = footer_top(s) + (s.px(FOOTER_H) - h) / 2;
+    let right = s.size().0 - s.px(SIDE);
+    let next = match page {
+        0 => "Get started",
+        3 => "Capture now",
+        _ => "Next",
+    };
+    l.scene.controls.push(Control { ctl: Ctl::Next, rect: IRect::new(right - w, y, w, h), kind: Kind::Primary { label: next } });
+    if page > 0 {
+        let bw = s.px(96.0);
+        l.scene.controls.push(Control { ctl: Ctl::Back, rect: IRect::new(right - w - s.px(10.0) - bw, y, bw, h), kind: Kind::Button { label: "Back", ghost: false } });
+    }
+    l.scene.height = l.y;
+    l.scene
+}
+
+/// Goes to another page of the welcome, sliding it in from the side it comes from.
+fn welcome_go(s: &mut State, page: usize) {
+    let Some(w) = &mut s.welcome else { return };
+    if page == w.page {
+        return;
+    }
+    stop_recording(s);
+    let Some(w) = &mut s.welcome else { return };
+    w.forward = page > w.page;
+    w.page = page.min(WELCOME_STEPS.len() - 1);
+    s.focus = None;
+    s.hover = None;
+    s.hover_row = None;
+    let still = s.anims.still;
+    s.anims.map.insert(Key::Page, Anim { value: if still { 1.0 } else { 0.0 }, velocity: 0.0, target: 1.0, motion: Motion::Spring });
+    s.restage();
+    animate(s);
+}
+
+/// How far into its opening turn the logo is, from 0 to 1.
+fn logo_progress(s: &State) -> f32 {
+    match &s.welcome {
+        Some(w) if !s.anims.still && !s.preview => (w.opened.elapsed().as_secs_f32() * 1000.0 / LOGO_MS).min(1.0),
+        _ => 1.0,
+    }
+}
+
+fn draw_welcome_chrome(s: &mut State, pm: &mut PixmapMut) {
+    let p = s.palette;
+    let (width, height) = s.size();
+    let rail = rail_w(s);
+    let rail_color = if p.high_contrast { p.bg } else { over(p.bg, p.ink(if p.dark { 0.035 } else { 0.03 })) };
+    ui::fill_rect(pm, IRect::new(0, 0, rail, height), rail_color);
+    ui::fill_rect(pm, IRect::new(rail - s.px(1.0).max(1), 0, s.px(1.0).max(1), height), p.line(0.07));
+
+    // The logo, its aperture turning shut and settling like a shutter.
+    let size = s.px(LOGO);
+    let (lx, ly) = ((rail - size) / 2, s.px(40.0));
+    let t = logo_progress(s);
+    let eased = 1.0 - (1.0 - t).powi(3);
+    let turn = -(1.0 - eased) * std::f32::consts::FRAC_PI_3 * 2.0;
+    let mut logo = render_turned(size as u32, turn);
+    logo.data_mut().chunks_exact_mut(4).for_each(|px| px.swap(0, 2));
+    pm.draw_pixmap(lx, ly, logo.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+
+    let name_top = ly + size + s.px(20.0);
+    let column = IRect::new(0, name_top, rail, s.px(30.0));
+    s.draw_text_centered(pm, crate::util::APP_NAME, Font { px: 22.0, weight: 700 }, column, p.text);
+    let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+    s.draw_text_centered(pm, &version, SMALL, IRect::new(0, name_top + s.px(30.0), rail, s.px(18.0)), p.muted);
+
+    // The steps, joined by a line.
+    let current = s.welcome.as_ref().map_or(0, |w| w.page);
+    let (left, dot, row) = (s.px(40.0), s.px(24.0), s.px(40.0));
+    let top = name_top + s.px(84.0);
+    let thin = s.px(1.0).max(1);
+    for (i, name) in WELCOME_STEPS.iter().enumerate() {
+        let y = top + i as i32 * row;
+        let (done, here) = (i < current, i == current);
+        let circle = IRect::new(left, y, dot, dot);
+        let (cx, cy, d) = (circle.x as f32, circle.y as f32, dot as f32);
+        if done || here {
+            fill_rr(pm, cx, cy, d, d, d / 2.0, p.accent);
+        } else {
+            fill_rr(pm, cx, cy, d, d, d / 2.0, rail_color);
+            stroke_rr(pm, cx, cy, d, d, d / 2.0, (1.5 * s.scale).max(1.0), p.line(0.16));
+        }
+        if done {
+            let (mx, my, u) = (cx + d / 2.0, cy + d / 2.0, s.scale);
+            let mut pb = PathBuilder::new();
+            pb.move_to(mx - 4.5 * u, my + 0.2 * u);
+            pb.line_to(mx - 1.3 * u, my + 3.3 * u);
+            pb.line_to(mx + 4.6 * u, my - 3.4 * u);
+            if let Some(path) = pb.finish() {
+                let stroke = Stroke { width: 1.8 * u, line_cap: LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Stroke::default() };
+                pm.stroke_path(&path, &paint(p.on_accent), &stroke, Transform::identity(), None);
+            }
+        } else {
+            s.draw_text_centered(pm, &(i + 1).to_string(), CAP, circle, if here { p.on_accent } else { p.muted });
+        }
+        let (font, color) = if here { (Font { px: 14.0, weight: 600 }, p.text) } else if done { (LABEL, p.secondary) } else { (LABEL, p.muted) };
+        let label_y = y + (dot - s.line_h(font)) / 2;
+        s.draw_text(pm, name, font, left + dot + s.px(14.0), label_y, color);
+        if i + 1 < WELCOME_STEPS.len() {
+            let line_top = y + dot + s.px(4.0);
+            ui::fill_rect(pm, IRect::new(left + dot / 2 - thin / 2, line_top, thin, row - dot - s.px(8.0)), if done { p.accent } else { p.line(0.12) });
+        }
+    }
+
+    // The foot's line, across the page.
+    ui::fill_rect(pm, IRect::new(rail, footer_top(s), width - rail, thin), p.line(0.07));
+    draw_captions(s, pm);
+}
+
+/// How tall the large shortcut is, with the line of others under it.
+fn big_caps_h(s: &State, others: &[String]) -> i32 {
+    s.px(BIG_CAP_H) + if others.is_empty() { 0 } else { s.px(14.0) + s.px(CAP_H) }
+}
+
+/// A shortcut drawn large and centred on the page, as keys, with "or" and the others that do the
+/// same, small, under it.
+fn draw_big_caps(s: &State, pm: &mut PixmapMut, keys: &str, others: &[String], top: i32) {
+    if !others.is_empty() {
+        let (or_w, or_h) = s.measure("or", SMALL);
+        let gap = s.px(8.0);
+        let total = or_w + gap + caps_width(s, others);
+        let left = content_x(s) + (content_w(s) - total) / 2 + s.page_dx(top);
+        let middle = top + s.px(BIG_CAP_H) + s.px(14.0) + s.px(CAP_H) / 2;
+        s.draw_text(pm, "or", SMALL, left, middle - or_h / 2, s.palette.muted);
+        draw_cap_groups(s, pm, others, left + total, middle, 1.0);
+    }
+    let p = s.palette;
+    let names: Vec<&str> = keys.split('+').map(|k| hotkey::cap_label(k.trim())).collect();
+    let font = Font { px: 22.0, weight: 600 };
+    let (h, gap, pad) = (s.px(BIG_CAP_H), s.px(12.0), s.px(22.0));
+    let widths: Vec<i32> = names.iter().map(|k| (s.measure(k, font).0 + pad * 2).max(h)).collect();
+    let total: i32 = widths.iter().sum::<i32>() + gap * (names.len() as i32 - 1);
+    let mut x = content_x(s) + (content_w(s) - total) / 2 + s.page_dx(top);
+    let radius = s.px(11.0) as f32;
+    for (name, w) in names.iter().zip(widths) {
+        let (fx, fy, fw, fh) = (x as f32, top as f32, w as f32, h as f32);
+        fill_rr(pm, fx, fy + 2.0 * s.scale, fw, fh, radius, p.ink(0.16));
+        fill_rr(pm, fx, fy, fw, fh - 2.0 * s.scale, radius, over(over(p.bg, p.ink(0.07)), p.ink(0.08)));
+        stroke_rr(pm, fx, fy, fw, fh, radius, s.scale.max(1.0).round(), p.line(0.09));
+        s.draw_text_centered(pm, name, font, IRect::new(x, top, w, h - s.px(3.0)), p.text);
+        x += w + gap;
+    }
 }
 
 // Descriptions that change with the choice. Rows make room for the longest, so they keep
@@ -1118,6 +1534,10 @@ fn enter_desc(i: usize) -> &'static str {
     }
 }
 
+fn toolbar_desc(i: usize) -> String {
+    format!("{} If there's no room there, it moves to the other side.", TOOLBAR_PLACES[i.min(TOOLBAR_PLACES.len() - 1)].0)
+}
+
 fn where_desc(i: usize) -> String {
     format!("{}, on the screen you captured. Problems with Prism show here even with popups off.", POPUP_POSITIONS[i.min(POPUP_POSITIONS.len() - 1)].0)
 }
@@ -1139,6 +1559,36 @@ fn paint(c: Rgba) -> Paint<'static> {
 
 fn fill_rr(pm: &mut PixmapMut, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgba) {
     if c.a == 0 || w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let whole = [x, y, w, h, r].iter().all(|v| v.fract() == 0.0);
+    if whole && r > 0.0 && h > 2.0 * r + 2.0 {
+        // A tall card: smoothing the edges of the whole shape costs more than everything else
+        // on the page put together, yet only the rounded ends need it. On whole pixels the
+        // straight middle is a plain rectangle, and the three parts meet exactly.
+        let k = r * 0.552_284_8;
+        let (right, bottom) = (x + w, y + h);
+        let mut pb = PathBuilder::new();
+        pb.move_to(x, y + r);
+        pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+        pb.line_to(right - r, y);
+        pb.cubic_to(right - r + k, y, right, y + r - k, right, y + r);
+        pb.close();
+        pb.move_to(x, bottom - r);
+        pb.line_to(right, bottom - r);
+        pb.cubic_to(right, bottom - r + k, right - r + k, bottom, right - r, bottom);
+        pb.line_to(x + r, bottom);
+        pb.cubic_to(x + r - k, bottom, x, bottom - r + k, x, bottom - r);
+        pb.close();
+        if let Some(path) = pb.finish() {
+            pm.fill_path(&path, &paint(c), FillRule::Winding, Transform::identity(), None);
+        }
+        if let Some(middle) = tiny_skia::Rect::from_xywh(x, y + r, w, h - 2.0 * r) {
+            let mut flat = paint(c);
+            flat.anti_alias = false;
+            pm.fill_rect(middle, &flat, Transform::identity(), None);
+        }
         return;
     }
     if let Some(path) = rounded_rect(x, y, w, h, r) {
@@ -1164,7 +1614,9 @@ fn rect_f(r: IRect) -> (f32, f32, f32, f32) {
 fn glass(s: &State, pm: &mut PixmapMut, r: IRect, radius: f32, strength: f32) {
     let p = &s.palette;
     let (x, y, w, h) = rect_f(r);
-    fill_rr(pm, x, y, w, h, radius, p.ink(0.04 * strength));
+    // Cards lie on the plain page, so their tint is worked out once and filled solid: blending
+    // it into every pixel of a page-sized card each frame was most of the cost of scrolling.
+    fill_rr(pm, x, y, w, h, radius, over(p.bg, p.ink(0.04 * strength)));
     stroke_rr(pm, x, y, w, h, radius, s.scale.max(1.0).round(), p.line(0.1 * strength));
 }
 
@@ -1212,8 +1664,11 @@ fn draw(s: &mut State, pm: &mut PixmapMut) {
     for heading in &scene.headings {
         let y = heading.y + header - s.scroll.round() as i32;
         if y + s.px(30.0) > header && y < height {
-            s.draw_text(pm, heading.text, HEADING, heading.x, y, p.text);
+            s.draw_text(pm, heading.text, HEADING, heading.x + s.page_dx(heading.y), y, p.text);
         }
+    }
+    if let Some((keys, others, top)) = &scene.big_caps {
+        draw_big_caps(s, pm, keys, others, *top);
     }
     for row in &scene.rows {
         draw_row(s, pm, row, header, height);
@@ -1224,12 +1679,13 @@ fn draw(s: &mut State, pm: &mut PixmapMut) {
         }
     }
     for note in &scene.notes {
-        let line_h = s.line_h(SMALL);
+        let line_h = s.line_h(note.font);
+        let dx = s.page_dx(note.y);
         for (i, text) in note.lines.iter().enumerate() {
             let y = note.y + header - s.scroll.round() as i32 + i as i32 * line_h;
             if y + line_h > header && y < height {
-                let x = if note.x < 0 { (width - s.measure(text, SMALL).0) / 2 } else { note.x };
-                s.draw_text(pm, text, SMALL, x, y, p.tone(note.tone));
+                let x = if note.x < 0 { (width - s.measure(text, note.font).0) / 2 } else { note.x + dx };
+                s.draw_text(pm, text, note.font, x, y, p.tone(note.tone));
             }
         }
     }
@@ -1245,15 +1701,19 @@ fn draw(s: &mut State, pm: &mut PixmapMut) {
     }
     s.scene = scene;
 
-    draw_scrollbar(s, pm);
-    draw_header(s, pm);
+    if s.welcome.is_some() {
+        draw_welcome_chrome(s, pm);
+    } else {
+        draw_scrollbar(s, pm);
+        draw_header(s, pm);
+    }
 }
 
 fn control_radius(s: &State, c: &Control) -> f32 {
     match c.kind {
-        Kind::Toggle(_) | Kind::Segments { .. } | Kind::Button { .. } => c.rect.h as f32 / 2.0,
+        Kind::Toggle(_) | Kind::Segments { .. } | Kind::Button { .. } | Kind::Primary { .. } => c.rect.h as f32 / 2.0,
         Kind::ToolKey(_) => s.px(8.0) as f32,
-        Kind::Picker(_) => s.px(8.0) as f32,
+        Kind::Picker(_) | Kind::BarPicker(_) => s.px(8.0) as f32,
         _ => s.px(9.0) as f32,
     }
 }
@@ -1261,6 +1721,7 @@ fn control_radius(s: &State, c: &Control) -> f32 {
 fn draw_row(s: &mut State, pm: &mut PixmapMut, row: &Row, header: i32, height: i32) {
     let p = s.palette;
     let r = s.on_screen(row.rect);
+    let label_x = row.label_x + s.page_dx(row.rect.y);
     if r.bottom() <= header || r.y >= height {
         return;
     }
@@ -1277,16 +1738,16 @@ fn draw_row(s: &mut State, pm: &mut PixmapMut, row: &Row, header: i32, height: i
     }
     let label_y = if row.desc.is_empty() { r.y + (r.h - s.line_h(LABEL)) / 2 } else { r.y + s.px(11.0) };
     if let Some(tool) = row.icon {
-        let box_ = IRect::new(row.label_x - s.px(30.0), r.y, s.px(22.0), r.h);
+        let box_ = IRect::new(label_x - s.px(30.0), r.y, s.px(22.0), r.h);
         ui::icon(pm, &s.font, Btn::Tool(tool), box_, p.secondary, s.scale, IconExtra { color: p.secondary, width: 4.0 });
     }
-    s.draw_text(pm, &row.label, LABEL, row.label_x, label_y, p.text);
+    s.draw_text(pm, &row.label, LABEL, label_x, label_y, p.text);
     if !row.caps.is_empty() {
-        draw_cap_groups(s, pm, &row.caps, row.caps_right, r.y + r.h / 2, if row.caps_on { 1.0 } else { 0.4 });
+        draw_cap_groups(s, pm, &row.caps, row.caps_right + (label_x - row.label_x), r.y + r.h / 2, if row.caps_on { 1.0 } else { 0.4 });
     }
     let line_h = s.line_h(SMALL);
     for (i, text) in row.desc.iter().enumerate() {
-        s.draw_text(pm, text, SMALL, row.label_x, r.y + s.px(31.0) + i as i32 * line_h, p.tone(row.tone));
+        s.draw_text(pm, text, SMALL, label_x, r.y + s.px(31.0) + i as i32 * line_h, p.tone(row.tone));
     }
 }
 
@@ -1365,6 +1826,15 @@ fn draw_control(s: &mut State, pm: &mut PixmapMut, c: &Control) {
             let color = if *ghost { mix(p.subtle, p.text, lit) } else if idle { mix(p.muted, p.subtle, lit) } else { p.text };
             s.draw_text_centered(pm, &text, font, r, color);
         }
+        Kind::Primary { label } => {
+            let lit = s.anims.follow(Key::Hover(c.ctl), if hovered { 1.0 } else { 0.0 }, QUICK_FADE);
+            let fill = if pressed { mix(p.accent, rgb(0, 0, 0), 0.16) } else { mix(p.accent, rgb(0xFF, 0xFF, 0xFF), 0.1 * lit) };
+            fill_rr(pm, x, y, w, h, h / 2.0, fill);
+            if p.high_contrast {
+                stroke_rr(pm, x, y, w, h, h / 2.0, 1.0, p.text);
+            }
+            s.draw_text_centered(pm, label, STRONG, r, p.on_accent);
+        }
         Kind::Recorder(slot) => {
             let listening = s.recording == Some(*slot);
             let lit = s.anims.follow(Key::Hover(c.ctl), if hovered || listening { 1.0 } else { 0.0 }, QUICK_FADE);
@@ -1441,6 +1911,7 @@ fn draw_control(s: &mut State, pm: &mut PixmapMut, c: &Control) {
             }
         }
         Kind::Picker(spot) => draw_picker(s, pm, c, r, *spot),
+        Kind::BarPicker(spot) => draw_bar_picker(s, pm, c, r, *spot),
     }
 }
 
@@ -1487,6 +1958,68 @@ fn draw_picker(s: &mut State, pm: &mut PixmapMut, c: &Control, r: IRect, chosen:
             fill_rr(pm, cx - dot / 2.0, cy - dot / 2.0, dot, dot, dot / 2.0, p.ink(0.22));
         }
         let _ = spot;
+    }
+}
+
+/// The region drawn in the toolbar picker, inside the control `r`.
+fn bar_region(s: &State, r: IRect) -> IRect {
+    let (mx, my) = (s.px(17.0), s.px(13.0));
+    IRect::new(r.x + mx, r.y + my, r.w - 2 * mx, r.h - 2 * my)
+}
+
+/// The toolbar picker's spots, in `TOOLBAR_PLACES` order: three above the region, one down
+/// each side, three below. Each is the area that picks it.
+fn bar_spots(s: &State, r: IRect) -> [IRect; 8] {
+    let g = bar_region(s, r);
+    let third = g.w / 3;
+    let row = |y: i32, h: i32, i: i32| IRect::new(g.x + i * third, y, if i == 2 { g.w - 2 * third } else { third }, h);
+    let (top, bottom) = (g.y - r.y, r.bottom() - g.bottom());
+    [
+        row(r.y, top, 0),
+        row(r.y, top, 1),
+        row(r.y, top, 2),
+        IRect::new(r.x, g.y, g.x - r.x, g.h),
+        IRect::new(g.right(), g.y, r.right() - g.right(), g.h),
+        row(g.bottom(), bottom, 0),
+        row(g.bottom(), bottom, 1),
+        row(g.bottom(), bottom, 2),
+    ]
+}
+
+/// A region with the toolbar drawn as a small bar at each place it can go: the chosen one in
+/// the accent colour, the one under the pointer lit, the rest as dots.
+fn draw_bar_picker(s: &mut State, pm: &mut PixmapMut, c: &Control, r: IRect, chosen: usize) {
+    let p = s.palette;
+    let g = bar_region(s, r);
+    let (x, y, w, h) = rect_f(g);
+    let radius = s.px(3.0) as f32;
+    fill_rr(pm, x, y, w, h, radius, p.ink(0.05));
+    stroke_rr(pm, x, y, w, h, radius, s.scale.max(1.0).round(), p.line(0.22));
+    let (long, thick, gap) = (s.px(16.0) as f32, s.px(6.0) as f32, s.px(3.0) as f32);
+    for i in 0..TOOLBAR_PLACES.len() {
+        let lit = s.anims.follow(Key::HoverPart(c.ctl, i), if s.hover == Some((c.ctl, i)) { 1.0 } else { 0.0 }, QUICK_FADE);
+        // The bar as the toolbar would sit: lying above or below, standing at the sides.
+        let (bx, by, bw, bh) = match i {
+            0 | 5 => (x, 0.0, long, thick),
+            1 | 6 => (x + (w - long) / 2.0, 0.0, long, thick),
+            2 | 7 => (x + w - long, 0.0, long, thick),
+            3 => (x - gap - thick, y, thick, long),
+            _ => (x + w + gap, y, thick, long),
+        };
+        let by = match i {
+            0..=2 => y - gap - thick,
+            5..=7 => y + h + gap,
+            _ => by,
+        };
+        if i == chosen {
+            fill_rr(pm, bx, by, bw, bh, thick / 2.0, p.accent);
+        } else if lit > 0.01 {
+            fill_rr(pm, bx, by, bw, bh, thick / 2.0, p.ink(0.35 * lit));
+        } else {
+            let dot = s.px(4.0) as f32;
+            let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
+            fill_rr(pm, cx - dot / 2.0, cy - dot / 2.0, dot, dot, dot / 2.0, p.ink(0.22));
+        }
     }
 }
 
@@ -1616,8 +2149,13 @@ fn draw_header(s: &mut State, pm: &mut PixmapMut) {
     ui::fill_rect(pm, IRect::new(0, 0, width, header), p.bg);
     let title_h = s.px(TITLE_H);
     s.draw_text(pm, "Settings", TITLE, s.px(MARGIN + 4.0), (title_h - s.line_h(TITLE)) / 2 + s.px(4.0), p.text);
+    draw_captions(s, pm);
+    draw_tabs_and_saved(s, pm);
+}
 
-    // Caption buttons.
+/// Minimize and close, at the top right.
+fn draw_captions(s: &mut State, pm: &mut PixmapMut) {
+    let p = s.palette;
     for (ctl, r) in caption_rects(s) {
         let lit = s.anims.follow(Key::Hover(ctl), if s.hover.map(|h| h.0) == Some(ctl) { 1.0 } else { 0.0 }, QUICK_FADE);
         let close = ctl == Ctl::Close;
@@ -1637,7 +2175,12 @@ fn draw_header(s: &mut State, pm: &mut PixmapMut) {
             line(pm, (cx - half, cy), (cx + half, cy), stroke, ink);
         }
     }
+}
 
+fn draw_tabs_and_saved(s: &mut State, pm: &mut PixmapMut) {
+    let p = s.palette;
+    let (width, _) = s.size();
+    let header = s.header_h();
     // "Saved": a quiet word at the end of the tab row that fades in and out.
     let saved = s.anims.follow(Key::Saved, if s.saved_on { 1.0 } else { 0.0 }, SLOW_FADE);
     if let (Some((text, alert)), true) = (s.saved.clone(), saved > 0.004) {
@@ -1744,6 +2287,10 @@ fn hit(s: &State, x: i32, y: i32) -> Hit {
                 Some(i) => i,
                 None => continue,
             },
+            Kind::BarPicker(_) => match bar_spots(s, s.on_screen(c.rect)).iter().position(|spot| spot.contains(x, y)) {
+                Some(i) => i,
+                None => continue,
+            },
             // The "Reset" at the end of a changed shortcut.
             Kind::Recorder(slot) if s.recording != Some(*slot) && !is_default(s, *slot) => {
                 let zone = s.measure("Reset", SMALL).0 + s.px(24.0);
@@ -1759,6 +2306,10 @@ fn hit(s: &State, x: i32, y: i32) -> Hit {
                 return Hit::Row(ctl);
             }
         }
+    }
+    // The welcome moves by its rail and the strip along its top.
+    if s.welcome.is_some() && (x < rail_w(s) || y < s.px(PAGE_TOP) - s.px(8.0)) {
+        return Hit::Caption;
     }
     Hit::None
 }
@@ -1853,6 +2404,23 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
         Ctl::Close => unsafe {
             let _ = PostMessageW(Some(s.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         },
+        Ctl::Back => {
+            let page = s.welcome.as_ref().map_or(0, |w| w.page);
+            welcome_go(s, page.saturating_sub(1));
+        }
+        Ctl::Next => {
+            let page = s.welcome.as_ref().map_or(0, |w| w.page);
+            if page + 1 < WELCOME_STEPS.len() {
+                welcome_go(s, page + 1);
+            } else {
+                if let Some(w) = &mut s.welcome {
+                    w.capture_after = true;
+                }
+                unsafe {
+                    let _ = PostMessageW(Some(s.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
         Ctl::Autostart => {
             if s.preview {
                 s.autostart = !s.autostart;
@@ -1868,8 +2436,7 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
             let on = !s.settings.replace_snipping;
             let applied = commit(s, |settings| settings.replace_snipping = on);
             s.snipping_failed = on && !applied.snipping_ok;
-            // Print Screen is the fourth shortcut Prism registers.
-            s.print_screen_problem = applied.hotkey_problems.iter().find(|(at, _)| *at == 3).map(|(_, problem)| {
+            s.print_screen_problem = applied.hotkey_problems.iter().find(|(at, _)| *at == crate::app::PRINT_SCREEN_SLOT).map(|(_, problem)| {
                 format!("{problem}. Sign out and back in once, then try again, so Windows lets go of it.")
             });
             s.restage();
@@ -1888,6 +2455,10 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
             }
             s.restage();
         }
+        Ctl::LiveCapture => {
+            let on = !s.settings.live_capture;
+            commit(s, |settings| settings.live_capture = on);
+        }
         Ctl::Magnifier => {
             let on = !s.settings.magnifier;
             commit(s, |settings| settings.magnifier = on);
@@ -1903,6 +2474,22 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
         Ctl::Notify => {
             let on = !s.settings.notify;
             commit(s, |settings| settings.notify = on);
+        }
+        Ctl::CheckUpdates => {
+            let on = !s.settings.check_updates;
+            commit(s, |settings| settings.check_updates = on);
+        }
+        Ctl::Update => {
+            use crate::update::Phase;
+            if !s.preview {
+                match crate::update::phase() {
+                    Phase::Ready(_) => crate::update::install(),
+                    Phase::Idle | Phase::UpToDate | Phase::Failed(_) => crate::update::check_now(),
+                    Phase::Available(_) => crate::update::open_page(),
+                    // Already on its way.
+                    Phase::Checking | Phase::Downloading(_) | Phase::Installing => {}
+                }
+            }
         }
         Ctl::QuickFinish => {
             let quick = QUICK[part.min(QUICK.len() - 1)].1;
@@ -1938,6 +2525,12 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
             let action = ENTER[part.min(ENTER.len() - 1)].1;
             if action != s.settings.enter_action {
                 commit(s, |settings| settings.enter_action = action);
+            }
+        }
+        Ctl::ToolbarPlace => {
+            let place = TOOLBAR_PLACES[part.min(TOOLBAR_PLACES.len() - 1)].1;
+            if place != s.settings.toolbar_place {
+                commit(s, |settings| settings.toolbar_place = place);
             }
         }
         Ctl::PopupPosition => {
@@ -2305,7 +2898,7 @@ fn tool_key_pressed(s: &mut State, i: usize, vk: u16) {
 
 /// Everything the keyboard can reach, in order.
 fn focus_order(s: &State) -> Vec<Ctl> {
-    let mut order = vec![Ctl::Tab];
+    let mut order = if s.welcome.is_some() { Vec::new() } else { vec![Ctl::Tab] };
     for c in &s.scene.controls {
         if !order.contains(&c.ctl) {
             order.push(c.ctl);
@@ -2342,6 +2935,7 @@ fn step_choice(s: &mut State, ctl: Ctl, by: i32) {
     let (current, parts) = match &c.kind {
         Kind::Segments { selected, segs, .. } => (*selected, segs.len()),
         Kind::Picker(spot) => (*spot, POPUP_POSITIONS.len()),
+        Kind::BarPicker(spot) => (*spot, TOOLBAR_PLACES.len()),
         _ => return,
     };
     let next = (current as i32 + by).clamp(0, parts as i32 - 1) as usize;
@@ -2354,6 +2948,20 @@ fn on_key(s: &mut State, vk: u16) -> bool {
     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
     let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
     let line = s.px(48.0) as f32;
+    if s.welcome.is_some() {
+        match vk {
+            // Enter moves on, unless it's pressing something that has the focus.
+            v if v == VK_RETURN.0 && s.focus.is_none() => activate(s, Ctl::Next, 0),
+            v if v == VK_TAB.0 && ctrl => {}
+            v if v == VK_UP.0 || v == VK_DOWN.0 || v == VK_PRIOR.0 || v == VK_NEXT.0 || v == VK_HOME.0 || v == VK_END.0 => {}
+            _ => return on_settings_key(s, vk, shift, ctrl, line),
+        }
+        return true;
+    }
+    on_settings_key(s, vk, shift, ctrl, line)
+}
+
+fn on_settings_key(s: &mut State, vk: u16, shift: bool, ctrl: bool, line: f32) -> bool {
     match vk {
         v if v == VK_TAB.0 && ctrl => {
             let tab = (current_tab(s) + if shift { TABS.len() - 1 } else { 1 }) % TABS.len();
@@ -2367,7 +2975,7 @@ fn on_key(s: &mut State, vk: u16) -> bool {
             if let Some(ctl) = s.focus {
                 s.focus_ring = true;
                 match s.control(ctl).map(|c| c.kind.clone()) {
-                    Some(Kind::Segments { .. } | Kind::Picker(_)) => {}
+                    Some(Kind::Segments { .. } | Kind::Picker(_) | Kind::BarPicker(_)) => {}
                     _ if ctl == Ctl::Tab => {}
                     _ => activate(s, ctl, 0),
                 }
@@ -2445,7 +3053,7 @@ fn on_mouse_move(s: &mut State, x: i32, y: i32) {
     }
     if hover != s.hover {
         // Some descriptions say what's under the pointer.
-        let describes = |h: Option<(Ctl, usize)>| matches!(h, Some((Ctl::AutoTool | Ctl::PopupPosition | Ctl::StartColor | Ctl::StartWidth, _)));
+        let describes = |h: Option<(Ctl, usize)>| matches!(h, Some((Ctl::AutoTool | Ctl::PopupPosition | Ctl::ToolbarPlace | Ctl::StartColor | Ctl::StartWidth, _)));
         if describes(hover) || describes(s.hover) {
             s.scene_stale = true;
         }
@@ -2633,6 +3241,7 @@ fn resize_canvas(s: &mut State) {
         return;
     }
     s.canvas = Canvas::new(w, h);
+    s.canvas_size = (w, h);
     s.restage();
     place_edit(s);
 }
@@ -2644,11 +3253,19 @@ fn on_paint(s: &mut State) {
     let mut scrolling = false;
     let gap = s.scroll_to - s.scroll;
     if gap.abs() > 0.5 {
-        let dt = 1.0 / 60.0;
-        s.scroll += gap * (1.0 - (-dt * 16.0f32).exp());
+        // By the time that really passed, so a late frame catches up instead of the glide
+        // stuttering. The first frame of a glide moves as one at 120 Hz would.
+        let now = Instant::now();
+        let dt = s.scroll_frame.map_or(1.0 / 120.0, |at| (now - at).as_secs_f32()).clamp(0.001, 0.05);
+        s.scroll_frame = Some(now);
+        s.scroll += gap * (1.0 - (-dt * SCROLL_RATE).exp());
+        if (s.scroll_to - s.scroll).abs() <= 0.5 {
+            s.scroll = s.scroll_to;
+        }
         scrolling = true;
     } else {
         s.scroll = s.scroll_to;
+        s.scroll_frame = None;
     }
     if scrolling {
         place_edit(s);
@@ -2663,8 +3280,16 @@ fn on_paint(s: &mut State) {
         }
         crate::util::log(&format!("settings: painted in {:?}", painting.elapsed()));
         let _ = EndPaint(s.hwnd, &ps);
-        if moving || scrolling || s.anims.busy() {
-            SetTimer(Some(s.hwnd), ANIM_TIMER, FRAME_MS, None);
+        if moving || scrolling || s.anims.busy() || logo_progress(s) < 1.0 {
+            // In step with the screen: wait for it to show this frame, then draw the next. A
+            // timer ticks every 15.6 ms whatever the screen does, which shows as judder. Input
+            // still comes first, as Windows only paints when nothing else is waiting.
+            if DwmFlush().is_ok() {
+                let _ = KillTimer(Some(s.hwnd), ANIM_TIMER);
+                s.invalidate();
+            } else {
+                SetTimer(Some(s.hwnd), ANIM_TIMER, FRAME_MS, None);
+            }
         } else {
             let _ = KillTimer(Some(s.hwnd), ANIM_TIMER);
             s.anims.settle();
@@ -2832,15 +3457,30 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, message: u32, wparam: WPARAM
             WM_CLOSE => {
                 stop_recording(s);
                 end_edit(s, true);
+                // However the welcome is closed, it's been seen.
+                let capture = s.welcome.as_ref().map(|w| w.capture_after);
+                if let Some(capture) = capture.filter(|_| !s.preview) {
+                    if !s.settings.onboarded {
+                        app::update_settings(|settings| settings.onboarded = true);
+                    }
+                    let _ = DestroyWindow(hwnd);
+                    if capture {
+                        // Once the welcome is off the screen, so it isn't in the capture.
+                        app::run_soon(app::Command::Region);
+                    }
+                    return LRESULT(0);
+                }
                 let _ = DestroyWindow(hwnd);
                 return LRESULT(0);
             }
             WM_DESTROY => {
-                CURRENT.with(|c| {
-                    if c.get() == Some(hwnd) {
-                        c.set(None);
-                    }
-                });
+                for current in [&CURRENT, &CURRENT_WELCOME] {
+                    current.with(|c| {
+                        if c.get() == Some(hwnd) {
+                            c.set(None);
+                        }
+                    });
+                }
                 let pointer = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut State;
                 if !pointer.is_null() {
                     let owned = Box::from_raw(pointer);
@@ -2905,7 +3545,7 @@ pub fn open(_main: HWND, _page: usize) {
     }
     let started = Instant::now();
     let Some(settings) = app::settings_snapshot() else { return };
-    if let Some(hwnd) = build(settings, false) {
+    if let Some(hwnd) = build(settings, false, false) {
         crate::util::log(&format!("settings: built in {:?}", started.elapsed()));
         CURRENT.with(|c| c.set(Some(hwnd)));
         unsafe {
@@ -2913,6 +3553,32 @@ pub fn open(_main: HWND, _page: usize) {
             crate::util::force_foreground(hwnd);
         }
         crate::util::log(&format!("settings: shown in {:?}", started.elapsed()));
+    }
+}
+
+/// Opens the welcome, or brings it forward if it's already open.
+pub fn open_welcome() {
+    if let Some(existing) = CURRENT_WELCOME.with(|c| c.get()) {
+        unsafe {
+            let _ = ShowWindow(existing, SW_RESTORE);
+            crate::util::force_foreground(existing);
+        }
+        return;
+    }
+    let Some(settings) = app::settings_snapshot() else { return };
+    if let Some(hwnd) = build(settings, false, true) {
+        CURRENT_WELCOME.with(|c| c.set(Some(hwnd)));
+        if let Some(s) = state(hwnd) {
+            // The logo turns from when it's on screen.
+            if let Some(w) = &mut s.welcome {
+                w.opened = Instant::now();
+            }
+            animate(s);
+        }
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            crate::util::force_foreground(hwnd);
+        }
     }
 }
 
@@ -2961,12 +3627,13 @@ pub fn eats_key(message: &MSG) -> bool {
     }
 }
 
-fn build(settings: Settings, preview: bool) -> Option<HWND> {
+fn build(settings: Settings, preview: bool, welcome: bool) -> Option<HWND> {
     register_class();
     let (dpi, work) = screen_to_open_on(preview);
     let scale = dpi as f32 / 96.0;
-    let mut width = (WIDTH * scale).round() as i32;
-    let mut height = (HEIGHT * scale).round() as i32;
+    let (w0, h0) = if welcome { (WELCOME_W, WELCOME_H) } else { (WIDTH, HEIGHT) };
+    let mut width = (w0 * scale).round() as i32;
+    let mut height = (h0 * scale).round() as i32;
     let (mut x, mut y) = (-32000, -32000);
     if let Some(work) = work {
         width = width.min(work.right - work.left - (16.0 * scale) as i32);
@@ -2974,7 +3641,7 @@ fn build(settings: Settings, preview: bool) -> Option<HWND> {
         x = work.left + (work.right - work.left - width) / 2;
         y = work.top + (work.bottom - work.top - height) / 2;
     }
-    let title = wide(&format!("{} Settings", crate::util::APP_NAME));
+    let title = wide(&if welcome { format!("Welcome to {}", crate::util::APP_NAME) } else { format!("{} Settings", crate::util::APP_NAME) });
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     let ex = if preview { WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE } else { WINDOW_EX_STYLE(0) };
     unsafe {
@@ -3014,6 +3681,7 @@ fn build(settings: Settings, preview: bool) -> Option<HWND> {
             anims: Anims::default(),
             scroll: 0.0,
             scroll_to: 0.0,
+            scroll_frame: None,
             pinned_tab: None,
             hover: None,
             hover_row: None,
@@ -3037,6 +3705,8 @@ fn build(settings: Settings, preview: bool) -> Option<HWND> {
             edit_font: HFONT::default(),
             edit_brush: HBRUSH::default(),
             preview,
+            welcome: welcome.then(|| Welcome { page: 0, forward: true, opened: Instant::now(), capture_after: false }),
+            canvas_size: (width, height),
         });
         let pointer = Box::into_raw(owned);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, pointer as isize);
@@ -3064,23 +3734,41 @@ pub fn preview(what: &str, out: &Path) -> i32 {
     let mut parts = what.split('-');
     let tab_key = parts.next().unwrap_or("general");
     let extras: Vec<&str> = parts.collect();
-    let Some(tab) = TAB_KEYS.iter().position(|key| *key == tab_key) else { return 2 };
+    // "welcome0" to "welcome3": a page of the welcome.
+    let welcome_page = tab_key.strip_prefix("welcome").map(|n| n.parse::<usize>().unwrap_or(0).min(WELCOME_STEPS.len() - 1));
+    let tab = match welcome_page {
+        Some(_) => 0,
+        None => match TAB_KEYS.iter().position(|key| *key == tab_key) {
+            Some(tab) => tab,
+            None => return 2,
+        },
+    };
     let path = crate::util::data_dir().join("settings.json");
     let text = std::fs::read_to_string(path).ok();
     let settings = match Settings::load(text.as_deref()) {
         Loaded::Ok(settings) | Loaded::Missing(settings) | Loaded::Invalid(settings, _) => settings,
     };
-    let Some(hwnd) = build(settings, true) else { return 3 };
+    let Some(hwnd) = build(settings, true, welcome_page.is_some()) else { return 3 };
     let Some(s) = state(hwnd) else { return 3 };
     if extras.contains(&"light") {
         s.palette = LIGHT;
     }
     s.anims.still = true;
     render(s);
-    jump_to_tab(s, tab);
-    s.scroll = s.scroll_to;
+    match welcome_page {
+        Some(page) => welcome_go(s, page),
+        None => {
+            jump_to_tab(s, tab);
+            s.scroll = s.scroll_to;
+        }
+    }
     for extra in &extras {
         match *extra {
+            "checking" => PREVIEW_UPDATE.with(|p| *p.borrow_mut() = Some(crate::update::Phase::Checking)),
+            "uptodate" => PREVIEW_UPDATE.with(|p| *p.borrow_mut() = Some(crate::update::Phase::UpToDate)),
+            "downloading" => PREVIEW_UPDATE.with(|p| *p.borrow_mut() = Some(crate::update::Phase::Downloading("1.1.0".into()))),
+            "ready" => PREVIEW_UPDATE.with(|p| *p.borrow_mut() = Some(crate::update::Phase::Ready("1.1.0".into()))),
+            "failed" => PREVIEW_UPDATE.with(|p| *p.borrow_mut() = Some(crate::update::Phase::Failed("Couldn't reach GitHub. Check your connection.".into()))),
             "recording" => start_recording(s, 0),
             "problem" => s.slot_notes[0] = Some("Ctrl+Alt+S is already used by another app, so Ctrl+Alt+Shift+S still works. Click to try another.".into()),
             "saved" => {
@@ -3172,7 +3860,7 @@ mod tests {
         for slot in 0..SHORTCUTS.len() {
             set_shortcut(&mut keys, slot, &format!("Ctrl+F{}", slot + 1));
         }
-        assert_eq!((keys.region.as_str(), keys.screen.as_str(), keys.text.as_str()), ("Ctrl+F1", "Ctrl+F2", "Ctrl+F3"));
+        assert_eq!((keys.region.as_str(), keys.screen.as_str(), keys.text.as_str(), keys.last.as_str(), keys.last_markup.as_str()), ("Ctrl+F1", "Ctrl+F2", "Ctrl+F3", "Ctrl+F4", "Ctrl+F5"));
         for slot in 0..SHORTCUTS.len() {
             assert_eq!(shortcut(&keys, slot), format!("Ctrl+F{}", slot + 1));
         }

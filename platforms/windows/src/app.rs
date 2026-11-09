@@ -34,11 +34,15 @@ pub const COPYDATA_TAG: usize = 0x5348_4F54;
 const HK_REGION: i32 = 1;
 const HK_SCREEN: i32 = 2;
 const HK_TEXT: i32 = 3;
+const HK_LAST: i32 = 5;
+const HK_LAST_MARKUP: i32 = 6;
 /// Print Screen on its own, which captures a region while Replace Snipping Tool is on.
 const HK_PRINT_SCREEN: i32 = 4;
-/// The hotkey ids in the order the settings window lists them: region, screen, text, and then
-/// Print Screen, which goes with the Replace Snipping Tool switch.
-const HOTKEY_SLOTS: [i32; 4] = [HK_REGION, HK_SCREEN, HK_TEXT, HK_PRINT_SCREEN];
+/// The hotkey ids in the order the settings window lists them: region, screen, text, the last
+/// region straight away and to mark up, and then Print Screen, which goes with the Replace Snipping Tool switch.
+const HOTKEY_SLOTS: [i32; 6] = [HK_REGION, HK_SCREEN, HK_TEXT, HK_LAST, HK_LAST_MARKUP, HK_PRINT_SCREEN];
+/// Where Print Screen comes in `HOTKEY_SLOTS`, for the settings window.
+pub const PRINT_SCREEN_SLOT: usize = 5;
 const TRAY_CLICK_TIMER: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +50,15 @@ pub enum Command {
     Region,
     Screen,
     Text,
+    /// The last region again, captured straight away.
+    Last,
+    /// The last region again, chosen and ready to mark up.
+    LastMarkup,
     Settings,
+    /// The welcome, again.
+    Welcome,
+    /// Install the downloaded update, or look for one.
+    Update,
     Quit,
 }
 
@@ -56,7 +68,11 @@ impl Command {
             "region" => Some(Command::Region),
             "screen" | "fullscreen" => Some(Command::Screen),
             "text" | "ocr" => Some(Command::Text),
+            "last" | "again" => Some(Command::Last),
+            "last-markup" => Some(Command::LastMarkup),
             "settings" => Some(Command::Settings),
+            "welcome" => Some(Command::Welcome),
+            "update" => Some(Command::Update),
             "quit" => Some(Command::Quit),
             _ => None,
         }
@@ -66,7 +82,11 @@ impl Command {
             Command::Region => "region",
             Command::Screen => "screen",
             Command::Text => "text",
+            Command::Last => "last",
+            Command::LastMarkup => "last-markup",
             Command::Settings => "settings",
+            Command::Welcome => "welcome",
+            Command::Update => "update",
             Command::Quit => "quit",
         }
     }
@@ -139,7 +159,7 @@ impl App {
         }
         let h = &self.settings.hotkeys;
         let print_screen = if uses_print_screen(&self.settings) { "PrintScreen" } else { "" }.to_string();
-        [(HK_REGION, &h.region), (HK_SCREEN, &h.screen), (HK_TEXT, &h.text), (HK_PRINT_SCREEN, &print_screen)]
+        [(HK_REGION, &h.region), (HK_SCREEN, &h.screen), (HK_TEXT, &h.text), (HK_LAST, &h.last), (HK_LAST_MARKUP, &h.last_markup), (HK_PRINT_SCREEN, &print_screen)]
             .into_iter()
             .filter_map(|(id, text)| hotkey::register(self.hwnd, id, text).err().map(|e| (id, e)))
             .collect()
@@ -257,7 +277,7 @@ pub fn create_window() -> Option<HWND> {
 }
 
 /// Set up state, tray and hotkeys. `first_command` runs once everything is ready.
-pub fn start(hwnd: HWND, first_command: Option<Command>, background: bool) {
+pub fn start(hwnd: HWND, first_command: Option<Command>, background: bool, updated: bool) {
     let path = crate::util::data_dir().join("settings.json");
     let text = std::fs::read_to_string(&path).ok();
     let (settings, first_run, writable, load_error) = match Settings::load(text.as_deref()) {
@@ -274,6 +294,9 @@ pub fn start(hwnd: HWND, first_command: Option<Command>, background: bool) {
     tray::add(hwnd, WM_TRAY, &tray_tip(&app.settings));
     let failures = app.register_hotkeys();
     let prompted = app.settings.printscreen_prompted;
+    // Someone new gets the welcome, which asks about Snipping Tool itself. A command from a
+    // launcher runs instead, and the welcome waits for the next ordinary start.
+    let welcome = !app.settings.onboarded && first_command.is_none();
     let replace_snipping = app.settings.replace_snipping;
     APP.with(|a| *a.borrow_mut() = Some(app));
 
@@ -286,6 +309,13 @@ pub fn start(hwnd: HWND, first_command: Option<Command>, background: bool) {
     if replace_snipping {
         // Re-assert on every start: Windows updates sometimes reset the Print Screen setting.
         apply_replace_snipping(hwnd, true);
+    } else if welcome {
+        if !prompted {
+            with(|a| {
+                a.settings.printscreen_prompted = true;
+                a.save_settings();
+            });
+        }
     } else if !prompted && system::snipping_owns_printscreen() {
         with(|a| {
             a.settings.printscreen_prompted = true;
@@ -304,9 +334,21 @@ pub fn start(hwnd: HWND, first_command: Option<Command>, background: bool) {
         failures.into_iter().filter(|(id, _)| !(reported && *id == HK_REGION)).map(|(_, m)| m).collect();
     if !failures.is_empty() {
         toast::show("Some shortcuts aren't available", &failures.join("; "), None, None, toast::Click::None);
-    } else if first_run && first_command.is_none() && !background {
+    } else if updated {
+        toast::show(
+            &format!("Updated to {APP_NAME} {}", env!("CARGO_PKG_VERSION")),
+            "Click to see what's new.",
+            None,
+            None,
+            toast::Click::Open(crate::update::this_version_page()),
+        );
+    } else if first_run && first_command.is_none() && !background && !welcome {
         let key = with(|a| region_keys(&a.settings)).unwrap_or_default();
         toast::show(&format!("{APP_NAME} is running"), &format!("Press {key} to capture. It lives in the tray."), None, None, toast::Click::None);
+    }
+    crate::update::start(hwnd);
+    if welcome {
+        settings_win::open_welcome();
     }
     if let Some(c) = first_command {
         run(c);
@@ -319,10 +361,17 @@ fn uses_print_screen(s: &Settings) -> bool {
     s.replace_snipping && !prism_core::settings::is_print_screen(&s.hotkeys.region)
 }
 
-/// "PrintScreen or Ctrl+Alt+S": every shortcut that starts a region capture.
-fn region_keys(s: &Settings) -> String {
+/// Every shortcut that starts a region capture, the main one first: Win+Shift+S once it's
+/// Prism's, as it's the one most people reach for, then Print Screen, then Prism's own.
+pub fn region_key_list(s: &Settings) -> Vec<String> {
+    let snipping = if s.replace_snipping { "Win+Shift+S" } else { "" };
     let print_screen = if uses_print_screen(s) { "PrintScreen" } else { "" };
-    [print_screen, s.hotkeys.region.trim()].into_iter().filter(|k| !k.is_empty()).collect::<Vec<_>>().join(" or ")
+    [snipping, print_screen, s.hotkeys.region.trim()].into_iter().filter(|k| !k.is_empty()).map(String::from).collect()
+}
+
+/// "Win+Shift+S or PrintScreen or Ctrl+Alt+S".
+fn region_keys(s: &Settings) -> String {
+    region_key_list(s).join(" or ")
 }
 
 fn tray_tip(s: &Settings) -> String {
@@ -368,12 +417,18 @@ pub fn run(cmd: Command) {
     with(|a| a.reload_if_changed());
     let Some((hwnd, s)) = with(|a| (a.hwnd, a.settings.clone())) else { return };
     match cmd {
-        Command::Region | Command::Text => {
+        Command::Region | Command::Text | Command::LastMarkup => {
+            // The last region, if it's still on a screen; otherwise this is an ordinary capture.
+            let preset = (cmd == Command::LastMarkup)
+                .then_some(s.last_region)
+                .flatten()
+                .map(|[x, y, w, h]| IRect::new(x, y, w, h).intersect(&capture::virtual_screen()))
+                .filter(|r| r.w >= 2 && r.h >= 2);
             toast::close();
             let opts = overlay::Options {
                 mode: if cmd == Command::Text { Mode::Text } else { Mode::Capture },
                 magnifier: s.magnifier,
-                capture_cursor: s.capture_cursor && cmd == Command::Region,
+                capture_cursor: s.capture_cursor && cmd != Command::Text,
                 style: s.starting_style(),
                 palette: s.palette.clone(),
                 enter: s.enter_action,
@@ -381,32 +436,52 @@ pub fn run(cmd: Command) {
                 quick_finish: s.quick_finish,
                 auto_tool: s.auto_tool,
                 tool_keys: s.tool_keys.clone(),
+                toolbar_place: s.toolbar_place,
+                live: s.live_capture,
+                preset,
             };
             if !overlay::open(hwnd, opts) {
                 toast::show("Couldn't capture the screen", "Try again in a moment.", None, None, toast::Click::None);
             }
         }
         Command::Screen => {
-            toast::close();
             let p = crate::util::cursor_pos();
             let (l, t, r, b) = crate::util::monitor_rect(crate::util::monitor_at(p));
-            let rect = IRect::from_ltrb(l, t, r, b);
-            match capture::grab(rect, s.capture_cursor) {
-                Some(img) => {
-                    let outcome = match s.enter_action {
-                        EnterAction::Copy => Outcome::Copy(img),
-                        EnterAction::Save => Outcome::Save(img),
-                        EnterAction::CopyAndSave => Outcome::CopyAndSave(img),
-                    };
-                    finish(Finished { outcome, tool: s.tool, style: s.style, screen_rect: Some(rect) });
-                }
-                None => toast::show("Couldn't capture the screen", "Try again in a moment.", None, None, toast::Click::None),
+            capture_now(IRect::from_ltrb(l, t, r, b), &s);
+        }
+        Command::Last => {
+            let last = s.last_region.map(|[x, y, w, h]| IRect::new(x, y, w, h).intersect(&capture::virtual_screen())).filter(|r| r.w >= 2 && r.h >= 2);
+            match last {
+                Some(rect) => capture_now(rect, &s),
+                // Nothing captured yet, or it was on a monitor that's gone: choose one.
+                None => run(Command::Region),
             }
         }
         Command::Settings => settings_win::open(hwnd, settings_win::PAGE_GENERAL),
+        Command::Welcome => settings_win::open_welcome(),
+        Command::Update => match crate::update::phase() {
+            crate::update::Phase::Ready(_) => crate::update::install(),
+            _ => crate::update::check_now(),
+        },
         Command::Quit => unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
         },
+    }
+}
+
+/// Capture `rect` (screen coordinates) with no overlay, and copy or save it as Enter would.
+fn capture_now(rect: IRect, s: &Settings) {
+    toast::close();
+    match capture::grab(rect, s.capture_cursor) {
+        Some(img) => {
+            let outcome = match s.enter_action {
+                EnterAction::Copy => Outcome::Copy(img),
+                EnterAction::Save => Outcome::Save(img),
+                EnterAction::CopyAndSave => Outcome::CopyAndSave(img),
+            };
+            finish(Finished { outcome, tool: s.tool, style: s.style, screen_rect: Some(rect) });
+        }
+        None => toast::show("Couldn't capture the screen", "Try again in a moment.", None, None, toast::Click::None),
     }
 }
 
@@ -451,10 +526,16 @@ fn spawn(main: SendHwnd, f: impl FnOnce() -> Job + Send + 'static) {
 }
 
 fn finish(done: Finished) {
+    // Remember where a capture was taken, for capturing the same region again.
+    let region = done.screen_rect.filter(|_| !matches!(done.outcome, Outcome::Cancel | Outcome::Color(_))).map(|r| [r.x, r.y, r.w, r.h]);
     let Some((hwnd, dir, pattern, save_copies)) = with(|a| {
-        if a.settings.style != done.style || a.settings.tool != done.tool {
+        let new_region = region.is_some() && a.settings.last_region != region;
+        if a.settings.style != done.style || a.settings.tool != done.tool || new_region {
             a.settings.style = done.style;
             a.settings.tool = done.tool;
+            if new_region {
+                a.settings.last_region = region;
+            }
             a.save_settings();
         }
         (a.hwnd, a.save_dir(), a.settings.file_name.clone(), a.settings.save_copies)
@@ -546,11 +627,16 @@ fn on_menu() {
     let Some((hwnd, hotkeys)) = with(|a| {
         a.reload_if_changed();
         let s = &a.settings.hotkeys;
-        (a.hwnd, [region_keys(&a.settings), s.screen.clone(), s.text.clone()])
+        // The menu has room for the main shortcut only.
+        (a.hwnd, [region_key_list(&a.settings).into_iter().next().unwrap_or_default(), s.screen.clone(), s.text.clone()])
     }) else {
         return;
     };
-    let Some(choice) = tray::show_menu(hwnd, &hotkeys) else { return };
+    let ready = match crate::update::phase() {
+        crate::update::Phase::Ready(v) => Some(v),
+        _ => None,
+    };
+    let Some(choice) = tray::show_menu(hwnd, &hotkeys, ready.as_deref()) else { return };
     use tray::Choice as C;
     match choice {
         // Let the menu fade out before freezing the screen.
@@ -565,11 +651,17 @@ fn on_menu() {
         }
         C::Settings => settings_win::open(hwnd, settings_win::PAGE_GENERAL),
         C::Quit => run(Command::Quit),
+        C::Update => crate::update::install(),
     }
 }
 
 thread_local! {
     static PENDING: RefCell<Option<Command>> = const { RefCell::new(None) };
+}
+
+/// Runs `cmd` in a moment, once a menu or window that's closing is off the screen.
+pub fn run_soon(cmd: Command) {
+    start_delayed(cmd);
 }
 
 fn start_delayed(cmd: Command) {
@@ -589,6 +681,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     HK_REGION | HK_PRINT_SCREEN => run(Command::Region),
                     HK_SCREEN => run(Command::Screen),
                     HK_TEXT => run(Command::Text),
+                    HK_LAST => run(Command::Last),
+                    HK_LAST_MARKUP => run(Command::LastMarkup),
                     _ => {}
                 }
                 LRESULT(0)
@@ -599,6 +693,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     WM_RBUTTONUP | WM_CONTEXTMENU => on_menu(),
                     _ => {}
                 }
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == crate::update::CHECK_TIMER || wp.0 == crate::update::PROMPT_TIMER => {
+                crate::update::on_timer(wp.0);
+                LRESULT(0)
+            }
+            crate::update::WM_UPDATE => {
+                crate::update::on_message(lp);
                 LRESULT(0)
             }
             WM_TIMER if wp.0 == TRAY_CLICK_TIMER => {

@@ -161,3 +161,13 @@ pub fn pick_folder(owner: HWND, start: &Path) -> Option<PathBuf> {
         item_path(&d.GetResult().ok()?)
     }
 }
+
+/// A text value under `HKEY_CURRENT_USER\path`.
+pub fn read_string(path: &str, name: &str) -> Option<String> {
+    let (ty, bytes) = read_value(path, name)?;
+    if ty != REG_SZ && ty != windows::Win32::System::Registry::REG_EXPAND_SZ {
+        return None;
+    }
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+    Some(String::from_utf16_lossy(&units))
+}

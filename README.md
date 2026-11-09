@@ -8,10 +8,14 @@ A small, fast screenshot and annotation tool for Windows. Press Print Screen, dr
 
 - **Region, window or screen.** Drag to select, or click to take the window under the cursor. Resize with the handles, or nudge with the arrow keys (Ctrl+arrows resize). F takes the whole monitor and Ctrl+A every monitor.
 - **Annotate in place.** Rectangle, ellipse, line, arrow, pen, highlighter, text, numbered steps, blur and pixelate. Eight colours with an optional fill, the scroll wheel for size, and Shift for straight lines and squares. Undo and redo, and the Select tool moves or deletes what you drew.
+- **Live or frozen.** By default the screen freezes the moment you press the shortcut. Turn on live capture in Settings and videos keep playing while you choose, with the shot taken as you let go.
+- **The same region again.** Ctrl+Alt+O captures the region you captured last, straight away, so before-and-after shots line up. Ctrl+Alt+Shift+O opens it ready to mark up instead.
 - **Copy text (OCR).** Ctrl+Print Screen, select, and the text is on the clipboard. Inside the editor, press O. This uses the OCR engine built into Windows, so there's nothing to download.
 - **Magnifier and colour picker.** It shows a pixel-level zoom with coordinates and the colour under the cursor while you select. Press C to copy that colour as a hex value.
 - **Copy, save or both.** Ctrl+C copies, Ctrl+S saves to your Screenshots folder, Ctrl+Shift+S asks where to save, and Enter does whichever one you choose in Settings. The clipboard gets a lossless PNG plus a standard bitmap.
 - **Quiet confirmation.** A small card shows a thumbnail and fades away. Click it to show the file in Explorer.
+- **A short welcome.** The first start walks you through your shortcut and how you like to capture, in four quick pages. Run `prism.exe --welcome` to see it again.
+- **Keeps itself up to date.** Prism looks for a new release shortly after it starts and once a day. A new version downloads in the background, then a popup offers to install it: one click, a second or two, and Prism is back on the new version. No browser, no installer to click through.
 
 ## Keys
 
@@ -20,8 +24,12 @@ A small, fast screenshot and annotation tool for Windows. Press Print Screen, dr
 | Ctrl+Alt+S, plus Print Screen and Win+Shift+S with Replace Snipping Tool on | Capture a region or a window |
 | Shift+Print Screen | Capture the monitor under the cursor straight away |
 | Ctrl+Print Screen | Copy text from a region |
+| Ctrl+Alt+O | Capture the last region again, straight away |
+| Ctrl+Alt+Shift+O | Open the last region again, ready to mark up |
 | Enter / double-click | Copy, save or both: you choose in Settings, which can make Esc finish too |
 | Hold Shift while letting go of a region | Finish straight away, without the toolbar. Choose the key, or turn it off, in Settings. |
+| Drag outside the region | Choose a new region, with any tool |
+| Shift+drag inside the region | Choose a new region within it, with the Select tool |
 | Ctrl+C / Ctrl+S / Ctrl+Shift+S | Copy / save / save as |
 | V R E L A D H T N B X | Select, Rectangle, Ellipse, Line, Arrow, Draw, Highlighter, Text, Numbered step, Blur, Pixelate. Change the letters in Settings, under Shortcuts. |
 | 1–8 | Pick a colour |
@@ -56,6 +64,8 @@ Starting the exe again hands the command to the copy that's already running, whi
 prism.exe --region   # also the default with no argument
 prism.exe --screen
 prism.exe --text
+prism.exe --welcome  # the first-start welcome, again
+prism.exe --update   # install a downloaded update, or look for one
 prism.exe --quit
 ```
 
@@ -65,7 +75,7 @@ Measured on the release build on Windows 11 with a 2560×1440 monitor. See [docs
 
 | | |
 |---|---|
-| Download | 1.1 MB single exe, no runtime needed |
+| Download | 1.8 MB single exe, no runtime needed |
 | Idle memory | 1.8 MB private, 11 MB working set |
 | Idle CPU | 0 ms over 10 s |
 | Shortcut to overlay on screen | 50 ms, of which screen capture is 27 ms |
@@ -96,7 +106,7 @@ A macOS host would reuse `prism-core` as is. See [docs/ROADMAP.md](docs/ROADMAP.
 
 ## Privacy
 
-There's no network access, no account and no telemetry. Settings are in `%APPDATA%\Prism\settings.json`, and captures go only where you save or copy them.
+The only network access is the update check. Prism asks GitHub for its latest release, and if it's newer, downloads it from GitHub and checks it against the size and SHA-256 GitHub lists. Nothing about you or your captures is sent. You can turn the check off in Settings, under General. There's no account and no telemetry. Settings are in `%APPDATA%\Prism\settings.json`, and captures go only where you save or copy them.
 
 ## Support
 

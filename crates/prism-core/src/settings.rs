@@ -60,6 +60,24 @@ pub enum PopupPosition {
     TopLeft,
 }
 
+/// Where the editing toolbar sits around a chosen region. If there's no room there, it moves to
+/// the opposite side, then inside the region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolbarPlace {
+    #[default]
+    BelowRight,
+    BelowCenter,
+    BelowLeft,
+    AboveRight,
+    AboveCenter,
+    AboveLeft,
+    /// Standing up along the left edge.
+    Left,
+    /// Standing up along the right edge.
+    Right,
+}
+
 impl FinishKey {
     pub fn enter(self) -> bool {
         matches!(self, FinishKey::Enter | FinishKey::Both)
@@ -84,11 +102,15 @@ pub struct Hotkeys {
     pub screen: String,
     /// Select a region and copy its text.
     pub text: String,
+    /// Capture the last region again, straight away.
+    pub last: String,
+    /// Open the last region again, chosen and ready to mark up.
+    pub last_markup: String,
 }
 
 impl Default for Hotkeys {
     fn default() -> Self {
-        Hotkeys { region: "Ctrl+Alt+S".into(), region_alt: String::new(), screen: "Shift+PrintScreen".into(), text: "Ctrl+PrintScreen".into() }
+        Hotkeys { region: "Ctrl+Alt+S".into(), region_alt: String::new(), screen: "Shift+PrintScreen".into(), text: "Ctrl+PrintScreen".into(), last: "Ctrl+Alt+O".into(), last_markup: "Ctrl+Alt+Shift+O".into() }
     }
 }
 
@@ -132,6 +154,12 @@ pub struct Settings {
     pub tool_keys: ToolKeys,
     /// Also save every copied capture to the folder, so nothing copied is ever lost.
     pub save_copies: bool,
+    /// Keep the screen running while a region is chosen, and capture it when you let go.
+    /// Off freezes the screen the moment the shortcut is pressed.
+    pub live_capture: bool,
+    /// The last region captured, in screen coordinates (x, y, width, height), for capturing it
+    /// again.
+    pub last_region: Option<[i32; 4]>,
     /// Magnifier with the pixel colour next to the cursor while selecting.
     pub magnifier: bool,
     /// Include the mouse pointer in captures.
@@ -140,6 +168,8 @@ pub struct Settings {
     pub notify: bool,
     /// Where on the screen popups appear.
     pub popup_position: PopupPosition,
+    /// Where the editing toolbar sits around the region.
+    pub toolbar_place: ToolbarPlace,
     /// Last-used tool and style, restored next time.
     pub tool: Tool,
     pub style: Style,
@@ -154,6 +184,17 @@ pub struct Settings {
     /// Take Snipping Tool's shortcuts (Print Screen and Win+Shift+S) for this app. Turning it
     /// off gives them back.
     pub replace_snipping: bool,
+    /// The welcome has been seen, so it doesn't open again. A settings file from before the
+    /// welcome existed counts as seen: only someone new gets it.
+    #[serde(default = "seen")]
+    pub onboarded: bool,
+    /// Look for a new version on start and once a day, download it in the background and offer
+    /// to install it.
+    pub check_updates: bool,
+}
+
+fn seen() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -169,10 +210,13 @@ impl Default for Settings {
             auto_tool: None,
             tool_keys: ToolKeys::default(),
             save_copies: false,
+            live_capture: false,
+            last_region: None,
             magnifier: true,
             capture_cursor: false,
             notify: true,
             popup_position: PopupPosition::BottomRight,
+            toolbar_place: ToolbarPlace::BelowRight,
             tool: Tool::Rect,
             style: Style::default(),
             start_color: None,
@@ -180,6 +224,8 @@ impl Default for Settings {
             palette: Rgba::DEFAULT_PALETTE.to_vec(),
             printscreen_prompted: false,
             replace_snipping: false,
+            onboarded: false,
+            check_updates: true,
         }
     }
 }
@@ -235,6 +281,9 @@ impl Settings {
         if let Some(c) = &mut self.start_color {
             c.a = 255;
         }
+        if self.last_region.is_some_and(|[_, _, w, h]| w < 2 || h < 2) {
+            self.last_region = None;
+        }
         self.tool_keys.sanitize();
         if self.auto_tool == Some(Tool::Select) {
             self.auto_tool = None;
@@ -252,7 +301,7 @@ mod tests {
     #[test]
     fn missing_and_round_trip() {
         assert_eq!(Settings::load(None), Loaded::Missing(Settings::default()));
-        let s = Settings { enter_action: EnterAction::Save, finish_key: FinishKey::Both, quick_finish: QuickFinish::Always, auto_tool: Some(Tool::Draw), popup_position: PopupPosition::TopCenter, ..Settings::default() };
+        let s = Settings { enter_action: EnterAction::Save, finish_key: FinishKey::Both, quick_finish: QuickFinish::Always, auto_tool: Some(Tool::Draw), popup_position: PopupPosition::TopCenter, toolbar_place: ToolbarPlace::Left, ..Settings::default() };
         assert_eq!(Settings::load(Some(&s.to_json())), Loaded::Ok(s));
     }
 
@@ -299,6 +348,15 @@ mod tests {
         assert_eq!(s.starting_style(), Style { color: Rgba::RED, width: 3.0, fill: true });
         let Loaded::Ok(s) = Settings::load(Some(r##"{"start_color": "#00FF0000", "start_width": 0}"##)) else { panic!() };
         assert_eq!((s.start_color.map(|c| c.a), s.start_width), (Some(255), None));
+    }
+
+    #[test]
+    fn only_someone_new_gets_the_welcome() {
+        assert!(!Settings::default().onboarded);
+        let Loaded::Ok(s) = Settings::load(Some(r#"{"magnifier": false}"#)) else { panic!() };
+        assert!(s.onboarded, "a file from before the welcome counts as seen");
+        let Loaded::Ok(s) = Settings::load(Some(r#"{"onboarded": false}"#)) else { panic!() };
+        assert!(!s.onboarded);
     }
 
     #[test]

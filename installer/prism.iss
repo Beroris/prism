@@ -63,14 +63,18 @@ Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#AppExe}"; Flags: ignoreve
 
 [Icons]
 Name: "{userprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Screenshot and annotate"
-Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Screenshot and annotate"; Tasks: desktopicon
+; An update leaves the desktop as the user has it.
+Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Screenshot and annotate"; Tasks: desktopicon; Check: not IsUpdate
 
 [Registry]
 ; The same entry Prism's own "Start Prism when I sign in" switch writes, so the two agree.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"" --background"; Tasks: autostart; Flags: uninsdeletevalue
+; An update leaves it as Prism's own switch last set it.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"" --background"; Tasks: autostart; Flags: uninsdeletevalue; Check: not IsUpdate
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName} now"; Flags: postinstall nowait skipifsilent
+; Prism started this update and quit for it, so it comes back when it's done, and says so.
+Filename: "{app}\{#AppExe}"; Parameters: "--background --updated"; Flags: nowait; Check: IsUpdate
 
 [UninstallDelete]
 Type: dirifempty; Name: "{app}"
@@ -79,18 +83,37 @@ Type: dirifempty; Name: "{app}"
 const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
 
+{ Prism runs Setup with /UPDATE when it updates itself. Setup then changes nothing but the
+  app, and starts it again at the end. }
+function IsUpdate(): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/UPDATE') = 0 then
+      Result := True;
+end;
+
 { Asks a running Prism to quit, so its exe can be replaced or removed and its hotkeys and
   keyboard hook let go. }
 procedure QuitPrism();
 var
   Code: Integer;
+  I: Integer;
   Exe: String;
 begin
   Exe := ExpandConstant('{app}\{#AppExe}');
   if FileExists(Exe) then
   begin
     Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
-    Sleep(600);
+  end;
+  { Prism holds this until its process has gone, and with it its hold on the exe. }
+  for I := 1 to 50 do
+  begin
+    if not CheckForMutexes('Local\Prism.Instance') then
+      Break;
+    Sleep(100);
   end;
 end;
 
@@ -103,7 +126,7 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   { Unticking the sign-in option on an upgrade turns it off, as it says. }
-  if (CurStep = ssPostInstall) and not WizardIsTaskSelected('autostart') then
+  if (CurStep = ssPostInstall) and not IsUpdate() and not WizardIsTaskSelected('autostart') then
     RegDeleteValue(HKCU, RunKey, '{#AppName}');
 end;
 

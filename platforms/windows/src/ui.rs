@@ -5,6 +5,7 @@
 
 use crate::text::GdiText;
 use prism_core::doc::Tool;
+use prism_core::settings::ToolbarPlace;
 use prism_core::icon::rounded_rect;
 use prism_core::render::{blend_mask, paint_color};
 use prism_core::{IRect, Rgba};
@@ -56,12 +57,82 @@ pub fn panel(pm: &mut PixmapMut, r: IRect, radius: f32, scale: f32) {
     stroke_rrect(pm, r, radius, 1.0, PANEL_BORDER);
 }
 
-/// Selection outline: a crisp line with a dark halo so it shows on any background.
-pub fn selection_border(pm: &mut PixmapMut, r: IRect, scale: f32) {
-    let w = (scale).max(1.0).round();
-    let outer = r.inflate(w as i32);
-    stroke_rect_px(pm, outer.inflate(1), 1.0, Rgba { r: 0, g: 0, b: 0, a: 0x50 });
-    stroke_rect_px(pm, outer, w, ACCENT);
+/// `r` grown by `d` on every side, but kept on the canvas: where the selection meets the edge of
+/// the screen, its frame is drawn just inside instead of off-screen.
+fn grow_on_canvas(pm: &PixmapMut, r: IRect, d: i32) -> IRect {
+    let (w, h) = (pm.width() as i32, pm.height() as i32);
+    IRect::from_ltrb((r.x - d).max(0), (r.y - d).max(0), (r.right() + d).min(w), (r.bottom() + d).min(h))
+}
+
+/// How the selection's frame is drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Frame {
+    /// The window or screen a click would pick: a plain accent outline.
+    Hover,
+    /// A region being dragged out, moved or resized: the frame plus guides at the thirds.
+    Dragging,
+    /// A chosen region while drawing in it: just the frame.
+    Plain,
+    /// A chosen region: the frame plus grips on the edges to resize it by.
+    Chosen,
+}
+
+/// The selection's frame: a thin white line with a soft shadow, and bracket corners.
+pub fn selection_frame(pm: &mut PixmapMut, r: IRect, kind: Frame, scale: f32) {
+    let line = scale.max(1.0).round() as i32;
+    if kind == Frame::Hover {
+        let w = (2.0 * scale).max(2.0).round() as i32;
+        let f = grow_on_canvas(pm, r, w);
+        stroke_rect_px(pm, grow_on_canvas(pm, f, 1), 1.0, Rgba { r: 0, g: 0, b: 0, a: 0x40 });
+        stroke_rect_px(pm, f, w as f32, ACCENT);
+        return;
+    }
+    if kind == Frame::Dragging && r.w as f32 > 90.0 * scale && r.h as f32 > 90.0 * scale {
+        let guide = Rgba { r: 0xFF, g: 0xFF, b: 0xFF, a: 0x30 };
+        for i in 1..3 {
+            fill_rect(pm, IRect::new(r.x + r.w * i / 3, r.y, 1, r.h), guide);
+            fill_rect(pm, IRect::new(r.x, r.y + r.h * i / 3, r.w, 1), guide);
+        }
+    }
+    // A soft shadow outside, so the line reads on light screens as well as dark ones.
+    let f = grow_on_canvas(pm, r, line);
+    for (i, a) in [0x48u8, 0x24, 0x10].iter().enumerate() {
+        stroke_rect_px(pm, grow_on_canvas(pm, f, i as i32 + 1), 1.0, Rgba { r: 0, g: 0, b: 0, a: *a });
+    }
+    stroke_rect_px(pm, f, line as f32, Rgba { r: 0xFF, g: 0xFF, b: 0xFF, a: 0xE6 });
+    // Bracket corners, and grips at the middle of each edge once it can be resized.
+    let t = (3.0 * scale).max(2.0).round() as i32;
+    let o = grow_on_canvas(pm, r, t);
+    let len = ((18.0 * scale) as i32).min(r.w.max(r.h) / 2).max(t * 2);
+    let (lx, ly) = (len.min(o.w / 2).max(t), len.min(o.h / 2).max(t));
+    let mut bars = vec![
+        IRect::new(o.x, o.y, lx, t),
+        IRect::new(o.x, o.y, t, ly),
+        IRect::new(o.right() - lx, o.y, lx, t),
+        IRect::new(o.right() - t, o.y, t, ly),
+        IRect::new(o.x, o.bottom() - t, lx, t),
+        IRect::new(o.x, o.bottom() - ly, t, ly),
+        IRect::new(o.right() - lx, o.bottom() - t, lx, t),
+        IRect::new(o.right() - t, o.bottom() - ly, t, ly),
+    ];
+    if kind == Frame::Chosen {
+        let g = (22.0 * scale) as i32;
+        if o.w > g + 2 * lx + 2 * t {
+            bars.push(IRect::new(o.x + (o.w - g) / 2, o.y, g, t));
+            bars.push(IRect::new(o.x + (o.w - g) / 2, o.bottom() - t, g, t));
+        }
+        if o.h > g + 2 * ly + 2 * t {
+            bars.push(IRect::new(o.x, o.y + (o.h - g) / 2, t, g));
+            bars.push(IRect::new(o.right() - t, o.y + (o.h - g) / 2, t, g));
+        }
+    }
+    let r_ = t as f32 / 2.0;
+    for b in &bars {
+        fill_rrect(pm, b.inflate(1), r_ + 1.0, Rgba { r: 0, g: 0, b: 0, a: 0x50 });
+    }
+    for b in &bars {
+        fill_rrect(pm, *b, r_, Rgba::WHITE);
+    }
 }
 
 fn stroke_rect_px(pm: &mut PixmapMut, r: IRect, width: f32, c: Rgba) {
@@ -103,6 +174,7 @@ pub enum Btn {
 impl Btn {
     pub fn tooltip(self, keys: &prism_core::doc::ToolKeys) -> String {
         match self {
+            Btn::Tool(Tool::Select) => format!("{}  {}   Shift+drag for a new region", Tool::Select.label(), keys.key(Tool::Select)),
             Btn::Tool(t) => format!("{}  {}", t.label(), keys.key(t)),
             Btn::Color => "Colour  1–8".into(),
             Btn::Width => "Size  scroll wheel".into(),
@@ -123,48 +195,94 @@ pub fn toolbar_items() -> Vec<Option<Btn>> {
     v
 }
 
+/// The side of the toolbar that tooltips and the palette open on: away from the region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Above,
+    Below,
+    Left,
+    Right,
+}
+
 pub struct ToolbarLayout {
     pub panel: IRect,
     pub buttons: Vec<(Btn, IRect)>,
     pub separators: Vec<IRect>,
-    /// Whether the toolbar sits above the selection (tooltips and the palette then open upward).
-    pub above: bool,
+    pub opens: Side,
 }
 
-pub fn layout_toolbar(sel: IRect, monitor: IRect, scale: f32) -> ToolbarLayout {
+pub fn layout_toolbar(sel: IRect, monitor: IRect, scale: f32, place: ToolbarPlace) -> ToolbarLayout {
     let b = (32.0 * scale).round() as i32;
     let pad = (4.0 * scale).round() as i32;
     let sep = (9.0 * scale).round() as i32;
     let gap = (8.0 * scale).round() as i32;
     let items = toolbar_items();
-    let width = pad * 2 + items.iter().map(|i| if i.is_some() { b } else { sep }).sum::<i32>();
-    let height = b + pad * 2;
-    // Prefer below, right-aligned with the selection; then above; then inside the bottom edge.
-    let x = (sel.right() - width).max(monitor.x + gap).min(monitor.right() - width - gap);
-    let (y, above) = if sel.bottom() + gap + height <= monitor.bottom() - gap {
-        (sel.bottom() + gap, false)
-    } else if sel.y - gap - height >= monitor.y + gap {
-        (sel.y - gap - height, true)
+    let long = pad * 2 + items.iter().map(|i| if i.is_some() { b } else { sep }).sum::<i32>();
+    let short = b + pad * 2;
+    // A side that's too short for the toolbar standing up gets it lying below instead.
+    let vertical = matches!(place, ToolbarPlace::Left | ToolbarPlace::Right) && long <= monitor.h - 2 * gap;
+    let place = if !vertical && matches!(place, ToolbarPlace::Left | ToolbarPlace::Right) { ToolbarPlace::BelowRight } else { place };
+    let (panel, opens) = if vertical {
+        let (w, h) = (short, long);
+        let y = sel.y.min(monitor.bottom() - gap - h).max(monitor.y + gap);
+        let right_fits = sel.right() + gap + w <= monitor.right() - gap;
+        let left_fits = sel.x - gap - w >= monitor.x + gap;
+        let (x, opens) = match place {
+            ToolbarPlace::Left if left_fits => (sel.x - gap - w, Side::Left),
+            ToolbarPlace::Right if right_fits => (sel.right() + gap, Side::Right),
+            _ if right_fits => (sel.right() + gap, Side::Right),
+            _ if left_fits => (sel.x - gap - w, Side::Left),
+            // No room either side: inside the edge it was asked for.
+            ToolbarPlace::Left => (sel.x + gap, Side::Right),
+            _ => (sel.right() - gap - w, Side::Left),
+        };
+        (IRect::new(x, y, w, h), opens)
     } else {
-        (sel.bottom() - gap - height, true)
+        let (w, h) = (long, short);
+        let x = match place {
+            ToolbarPlace::BelowLeft | ToolbarPlace::AboveLeft => sel.x,
+            ToolbarPlace::BelowCenter | ToolbarPlace::AboveCenter => sel.x + (sel.w - w) / 2,
+            _ => sel.right() - w,
+        };
+        let x = x.min(monitor.right() - w - gap).max(monitor.x + gap);
+        let below_fits = sel.bottom() + gap + h <= monitor.bottom() - gap;
+        let above_fits = sel.y - gap - h >= monitor.y + gap;
+        let wants_above = matches!(place, ToolbarPlace::AboveLeft | ToolbarPlace::AboveCenter | ToolbarPlace::AboveRight);
+        // The side asked for, then the other side, then inside the edge asked for.
+        let (y, opens) = match (wants_above, above_fits, below_fits) {
+            (true, true, _) | (false, true, false) => (sel.y - gap - h, Side::Above),
+            (false, _, true) | (true, false, true) => (sel.bottom() + gap, Side::Below),
+            (true, false, false) => (sel.y + gap, Side::Below),
+            (false, false, false) => (sel.bottom() - gap - h, Side::Above),
+        };
+        (IRect::new(x, y, w, h), opens)
     };
-    let panel = IRect::new(x.max(monitor.x), y, width, height);
     let mut buttons = Vec::new();
     let mut separators = Vec::new();
-    let mut cx = panel.x + pad;
+    let mut at = if vertical { panel.y + pad } else { panel.x + pad };
     for item in items {
-        match item {
-            Some(btn) => {
-                buttons.push((btn, IRect::new(cx, panel.y + pad, b, b)));
-                cx += b;
-            }
-            None => {
-                separators.push(IRect::new(cx + sep / 2, panel.y + pad + b / 4, 1, b / 2));
-                cx += sep;
-            }
+        let step = if item.is_some() { b } else { sep };
+        match (item, vertical) {
+            (Some(btn), false) => buttons.push((btn, IRect::new(at, panel.y + pad, b, b))),
+            (Some(btn), true) => buttons.push((btn, IRect::new(panel.x + pad, at, b, b))),
+            (None, false) => separators.push(IRect::new(at + sep / 2, panel.y + pad + b / 4, 1, b / 2)),
+            (None, true) => separators.push(IRect::new(panel.x + pad + b / 4, at + sep / 2, b / 2, 1)),
         }
+        at += step;
     }
-    ToolbarLayout { panel, buttons, separators, above }
+    ToolbarLayout { panel, buttons, separators, opens }
+}
+
+/// Where a popup of size `w`×`h` beside `anchor` goes, on the `opens` side, kept on the monitor.
+pub fn beside(anchor: IRect, opens: Side, w: i32, h: i32, gap: i32, monitor: IRect) -> IRect {
+    let cx = (anchor.x + anchor.w / 2 - w / 2).clamp(monitor.x + 4, (monitor.right() - w - 4).max(monitor.x + 4));
+    let cy = (anchor.y + anchor.h / 2 - h / 2).clamp(monitor.y + 4, (monitor.bottom() - h - 4).max(monitor.y + 4));
+    match opens {
+        Side::Above => IRect::new(cx, anchor.y - gap - h, w, h),
+        Side::Below => IRect::new(cx, anchor.bottom() + gap, w, h),
+        Side::Left => IRect::new(anchor.x - gap - w, cy, w, h),
+        Side::Right => IRect::new(anchor.right() + gap, cy, w, h),
+    }
 }
 
 /// Palette popup: one swatch per colour, then a fill toggle.
@@ -174,16 +292,15 @@ pub struct PaletteLayout {
     pub fill: IRect,
 }
 
-pub fn layout_palette(anchor: IRect, above: bool, colors: &[Rgba], monitor: IRect, scale: f32) -> PaletteLayout {
+pub fn layout_palette(anchor: IRect, opens: Side, colors: &[Rgba], monitor: IRect, scale: f32) -> PaletteLayout {
     let s = (26.0 * scale).round() as i32;
     let pad = (6.0 * scale).round() as i32;
     let gap = (4.0 * scale).round() as i32;
     let n = colors.len() as i32 + 1;
     let width = pad * 2 + n * s + (n - 1) * gap + gap * 2;
     let height = s + pad * 2;
-    let x = (anchor.x + anchor.w / 2 - width / 2).clamp(monitor.x + 4, (monitor.right() - width - 4).max(monitor.x + 4));
-    let y = if above { anchor.y - height - (10.0 * scale) as i32 } else { anchor.bottom() + (10.0 * scale) as i32 };
-    let panel = IRect::new(x, y, width, height);
+    let panel = beside(anchor, opens, width, height, (10.0 * scale) as i32, monitor);
+    let (x, y) = (panel.x, panel.y);
     let mut swatches = Vec::new();
     let mut cx = x + pad;
     for c in colors {
@@ -442,22 +559,15 @@ pub fn fill_toggle(pm: &mut PixmapMut, r: IRect, on: bool, color: Rgba, scale: f
     }
 }
 
-/// Selection resize handles: corners and edge midpoints.
+/// Where the selection can be grabbed to resize it: the bracket corners and the edge grips
+/// `selection_frame` draws, in the order NW, N, NE, E, SE, S, SW, W.
 pub fn handle_rects(sel: IRect, scale: f32) -> [IRect; 8] {
-    let s = (7.0 * scale).round() as i32 | 1;
-    let h = s / 2;
+    let c = (14.0 * scale).round() as i32;
+    let (g, d) = ((26.0 * scale).round() as i32, (10.0 * scale).round() as i32);
     let (l, t, r, b) = (sel.x - 1, sel.y - 1, sel.right(), sel.bottom());
     let (mx, my) = (sel.x + sel.w / 2, sel.y + sel.h / 2);
-    let at = |x: i32, y: i32| IRect::new(x - h, y - h, s, s);
-    [at(l, t), at(mx, t), at(r, t), at(r, my), at(r, b), at(mx, b), at(l, b), at(l, my)]
-}
-
-pub fn draw_handles(pm: &mut PixmapMut, sel: IRect, scale: f32) {
-    for h in handle_rects(sel, scale) {
-        fill_rrect(pm, h.inflate(1), 2.0, Rgba { r: 0, g: 0, b: 0, a: 0x60 });
-        fill_rrect(pm, h, 1.5 * scale, Rgba::WHITE);
-        stroke_rrect(pm, h, 1.5 * scale, 1.0, ACCENT);
-    }
+    let at = |x: i32, y: i32, w: i32, h: i32| IRect::new(x - w / 2, y - h / 2, w, h);
+    [at(l, t, c, c), at(mx, t, g, d), at(r, t, c, c), at(r, my, d, g), at(r, b, c, c), at(mx, b, g, d), at(l, b, c, c), at(l, my, d, g)]
 }
 
 /// A small dark pill with text, e.g. the selection size.
@@ -466,7 +576,9 @@ pub fn pill(pm: &mut PixmapMut, t: &GdiText, s: &str, x: i32, y: i32, scale: f32
     let (w, h) = t.measure(s, px, true);
     let (padx, pady) = ((8.0 * scale) as i32, (3.0 * scale) as i32);
     let r = IRect::new(x, y, w + padx * 2, h + pady * 2);
+    fill_rrect(pm, r.inflate(1).offset(0, 1), 6.0 * scale, Rgba { r: 0, g: 0, b: 0, a: 0x30 });
     fill_rrect(pm, r, 5.0 * scale, Rgba { r: 0x14, g: 0x14, b: 0x18, a: 0xE6 });
+    stroke_rrect(pm, r, 5.0 * scale, 1.0, PANEL_BORDER);
     text(pm, t, s, px, true, x + padx, y + pady, FG);
     r
 }

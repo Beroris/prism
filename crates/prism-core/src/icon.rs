@@ -20,6 +20,12 @@ const BLADES: [(f32, f32, f32, f32); 6] = [
 
 /// Draw the icon at `size`×`size` as **RGBA** premultiplied (tiny-skia's native order).
 pub fn render_rgba(size: u32) -> Pixmap {
+    render_turned(size, 0.0)
+}
+
+/// The icon with its aperture blades turned by `turn` radians, as a shutter turns: the welcome
+/// animates it.
+pub fn render_turned(size: u32, turn: f32) -> Pixmap {
     let mut pm = Pixmap::new(size, size).expect("icon size");
     let s = size as f32 / 64.0;
     let c = size as f32 / 2.0;
@@ -44,11 +50,17 @@ pub fn render_rgba(size: u32) -> Pixmap {
     }
     // Blades, scaled so their outer ends meet the ring's centre line.
     let k = rim / 10.0 * s;
-    let at = |v: f32| c + (v - 12.0) * k;
+    let (sin, cos) = turn.sin_cos();
+    let at = |x: f32, y: f32| {
+        let (dx, dy) = ((x - 12.0) * k, (y - 12.0) * k);
+        (c + dx * cos - dy * sin, c + dx * sin + dy * cos)
+    };
     let mut pb = PathBuilder::new();
     for (x1, y1, x2, y2) in BLADES {
-        pb.move_to(at(x1), at(y1));
-        pb.line_to(at(x2), at(y2));
+        let (ax, ay) = at(x1, y1);
+        let (bx, by) = at(x2, y2);
+        pb.move_to(ax, ay);
+        pb.line_to(bx, by);
     }
     if let Some(p) = pb.finish() {
         let stroke = Stroke { width: (3.4 * s).max(1.1), line_cap: LineCap::Round, ..Stroke::default() };

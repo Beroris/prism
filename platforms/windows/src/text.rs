@@ -65,6 +65,8 @@ pub struct GdiText {
     face: &'static str,
     fonts: RefCell<HashMap<(u32, u32), HFONT>>,
     cache: RefCell<HashMap<(String, u32, u32), std::rc::Rc<TextMask>>>,
+    /// Sizes already measured: a page of text is measured many times a frame.
+    sizes: RefCell<HashMap<(String, u32, u32), (i32, i32)>>,
 }
 
 /// The weight `bold` has always meant here.
@@ -79,7 +81,7 @@ impl GdiText {
 
     pub fn with_face(face: &'static str) -> GdiText {
         let dc = unsafe { CreateCompatibleDC(None) };
-        GdiText { dc, face, fonts: RefCell::new(HashMap::new()), cache: RefCell::new(HashMap::new()) }
+        GdiText { dc, face, fonts: RefCell::new(HashMap::new()), cache: RefCell::new(HashMap::new()), sizes: RefCell::new(HashMap::new()) }
     }
 
     fn font(&self, px: u32, weight: u32) -> HFONT {
@@ -114,6 +116,20 @@ impl GdiText {
     /// `measure` at a weight from 100 to 900.
     pub fn measure_weight(&self, text: &str, px: f32, weight: u32) -> (i32, i32) {
         let px = px.round().max(6.0) as u32;
+        let key = (text.to_string(), px, weight);
+        if let Some(size) = self.sizes.borrow().get(&key) {
+            return *size;
+        }
+        let size = self.measure_uncached(text, px, weight);
+        let mut sizes = self.sizes.borrow_mut();
+        if sizes.len() > 4096 {
+            sizes.clear();
+        }
+        sizes.insert(key, size);
+        size
+    }
+
+    fn measure_uncached(&self, text: &str, px: u32, weight: u32) -> (i32, i32) {
         let t = if text.is_empty() { " ".to_string() } else { text.to_string() };
         // A trailing newline still adds a line: measure it with a space after.
         let t = if t.ends_with('\n') { format!("{t} ") } else { t };
@@ -180,7 +196,7 @@ impl GdiText {
         }
         let m = std::rc::Rc::new(self.render(text, px, weight)?);
         let mut cache = self.cache.borrow_mut();
-        if cache.len() > 256 {
+        if cache.len() > 1024 {
             cache.clear();
         }
         cache.insert(key, m.clone());

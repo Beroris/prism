@@ -20,10 +20,10 @@ use prism_core::render::Canvas;
 use prism_core::{Doc, IRect, Image, Pt, Rgba};
 use std::cell::RefCell;
 use tiny_skia::PixmapMut;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, EndPaint, GdiFlush, HBITMAP, HDC, HGDIOBJ, InvalidateRect, PAINTSTRUCT, SRCCOPY, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -32,11 +32,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RIGHT, VK_MENU, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_CROSS,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, IDC_CROSS,
     IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, RegisterClassExW,
     SW_SHOW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, HWND_TOPMOST,
-    SWP_NOMOVE, SWP_NOSIZE, WM_CAPTURECHANGED, WM_CHAR, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    SWP_NOMOVE, SWP_NOSIZE, WM_CAPTURECHANGED, WM_CHAR, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
+    SetWindowDisplayAffinity, ULW_ALPHA, UPDATELAYEREDWINDOWINFO, UpdateLayeredWindowIndirect, WDA_EXCLUDEFROMCAPTURE, WS_EX_LAYERED,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{BOOL, PCWSTR};
@@ -82,12 +83,20 @@ pub struct Options {
     pub quick_finish: prism_core::settings::QuickFinish,
     pub auto_tool: Option<Tool>,
     pub tool_keys: prism_core::doc::ToolKeys,
+    pub toolbar_place: prism_core::settings::ToolbarPlace,
+    /// Keep the screen running until a region is chosen, instead of freezing it straight away.
+    pub live: bool,
+    /// A region, in screen coordinates, to start with already chosen: the last one, again.
+    pub preset: Option<IRect>,
 }
 
 const CLASS: &str = "PrismOverlay";
 const CARET_TIMER: usize = 1;
 /// How much of the colour to keep outside the selection, out of 256.
 const DIM_KEEP: u16 = 150;
+/// Before a region is chosen, the window or screen a click would pick is dimmed this much (less
+/// than outside it), so it is plain the overlay is up even when that window fills the screen.
+const HOVER_KEEP: u16 = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handle {
@@ -106,7 +115,8 @@ const HANDLES: [Handle; 8] = [Handle::NW, Handle::N, Handle::NE, Handle::E, Hand
 enum Drag {
     None,
     /// Mouse down while choosing a region; becomes a rectangle once it moves.
-    NewSel { start: (i32, i32), moved: bool },
+    /// `inner`: started inside the region with Shift held, to choose a new one within it.
+    NewSel { start: (i32, i32), moved: bool, inner: bool },
     MoveSel { start: (i32, i32), orig: IRect },
     Resize { handle: Handle, orig: IRect },
     Draw { shape: Shape, start: Pt },
@@ -198,9 +208,21 @@ pub struct Overlay {
     /// to nothing.
     reselect_from: Option<IRect>,
     tool_keys: prism_core::doc::ToolKeys,
+    toolbar_place: prism_core::settings::ToolbarPlace,
     text: GdiText,
     /// Everything drawn over plain `dim` in the last frame, so it can be cleared next frame.
     last_bounds: IRect,
+    /// The window is layered (it was opened live), so frames go out with UpdateLayeredWindow
+    /// rather than through WM_PAINT.
+    layered: bool,
+    /// Still live: the screen hasn't been captured yet, so `base`, `dim` and `committed` are
+    /// empty and the desktop shows through.
+    live: bool,
+    /// Whether the window is kept out of screen captures, so the screen can be captured with it up.
+    unseen: bool,
+    capture_cursor: bool,
+    /// Live, the pixels around the pointer for the magnifier, `MAG_CELLS` square.
+    sample: Image,
 }
 
 thread_local! {
@@ -231,6 +253,9 @@ fn register_class() {
 }
 
 /// Capture the screen and open the overlay. Returns false if capture failed.
+///
+/// With `opts.live`, the screen isn't captured yet: the overlay is a see-through layered window
+/// over the running desktop, and the screen is captured (`freeze`) the moment a region is chosen.
 pub fn open(main: HWND, opts: Options) -> bool {
     if let Some(h) = current() {
         unsafe {
@@ -240,18 +265,20 @@ pub fn open(main: HWND, opts: Options) -> bool {
     }
     let t0 = std::time::Instant::now();
     let vs = capture::virtual_screen();
-    let Some(base) = capture::grab(vs, opts.capture_cursor) else { return false };
+    let live = opts.live && opts.preset.is_none();
+    let base = if live { Image::new(0, 0) } else { match capture::grab(vs, opts.capture_cursor) { Some(b) => b, None => return false } };
     let t_grab = t0.elapsed();
     register_class();
     let origin = (vs.x, vs.y);
-    let (w, h) = (base.w, base.h);
-    let dim = base.dimmed(DIM_KEEP);
+    let (w, h) = (vs.w as u32, vs.h as u32);
+    let dim = if live { Image::new(0, 0) } else { base.dimmed(DIM_KEEP) };
     let committed = base.clone();
     let monitors = capture::monitors(origin);
     unsafe {
         let class = wide(CLASS);
+        let ex = if live { WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED } else { WS_EX_TOPMOST | WS_EX_TOOLWINDOW };
         let Ok(hwnd) = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            ex,
             PCWSTR(class.as_ptr()),
             PCWSTR(wide(crate::util::APP_NAME).as_ptr()),
             WS_POPUP,
@@ -268,6 +295,9 @@ pub fn open(main: HWND, opts: Options) -> bool {
         };
         let disable: BOOL = true.into();
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disable as *const _ as *const _, 4);
+        // Live, the screen is captured with the overlay still up: keep it out of the capture.
+        // Windows before 10 version 2004 can't, so there it's hidden for the moment of capture.
+        let unseen = live && SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok();
         let Some(back) = make_back(w as i32, h as i32) else {
             let _ = DestroyWindow(hwnd);
             return false;
@@ -310,19 +340,37 @@ pub fn open(main: HWND, opts: Options) -> bool {
             auto_tool: opts.auto_tool,
             reselect_from: None,
             tool_keys: opts.tool_keys,
+            toolbar_place: opts.toolbar_place,
             text: GdiText::new(),
             last_bounds: IRect::default(),
+            layered: live,
+            live,
+            unseen,
+            capture_cursor: opts.capture_cursor,
+            sample: Image::new(0, 0),
         });
         ov.update_hover();
+        ov.sample_under_cursor();
+        if let Some(r) = opts.preset.map(|r| r.offset(-origin.0, -origin.1).intersect(&ov.bounds)).filter(|r| r.w >= 2 && r.h >= 2) {
+            // The last region again: chosen already, ready to finish or mark up.
+            ov.sel = Some(r);
+            ov.hover_window = None;
+            if let Some(tool) = ov.auto_tool {
+                ov.set_tool(tool);
+            }
+        }
         // Compose the whole first frame before showing, so nothing flashes.
         ov.compose(ov.bounds);
         ov.last_bounds = ov.chrome_bounds();
+        if ov.layered {
+            let _ = ov.present(ov.bounds);
+        }
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ov) as isize);
         OPEN.with(|o| *o.borrow_mut() = Some(SendHwnd::new(hwnd)));
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         crate::util::force_foreground(hwnd);
-        crate::util::log(&format!("overlay: grab {:?}, visible {:?}", t_grab, t0.elapsed()));
+        crate::util::log(&format!("overlay: grab {:?}, visible {:?}, live {live}", t_grab, t0.elapsed()));
     }
     true
 }
@@ -397,7 +445,7 @@ impl Overlay {
     /// The selection as it is right now, including one being dragged out.
     fn live_sel(&self) -> Option<IRect> {
         match &self.drag {
-            Drag::NewSel { start, moved: true } => {
+            Drag::NewSel { start, moved: true, .. } => {
                 Some(IRect::spanning(start.0, start.1, self.mouse.0, self.mouse.1).intersect(&self.bounds))
             }
             _ => self.sel,
@@ -408,7 +456,8 @@ impl Overlay {
     fn bright(&self) -> Option<IRect> {
         match &self.drag {
             Drag::NewSel { moved: true, .. } => self.live_sel(),
-            Drag::NewSel { moved: false, .. } => self.hover_window.or(self.sel),
+            // A click that may yet become a drag: keep showing what was there.
+            Drag::NewSel { moved: false, .. } => self.hover_window.or(self.sel).or(self.reselect_from),
             _ => self.sel.or(self.hover_window),
         }
     }
@@ -435,8 +484,15 @@ impl Overlay {
             return None;
         }
         let sel = self.sel?;
-        let mon = self.monitor_of(sel.x + sel.w / 2, sel.bottom().min(self.bounds.bottom() - 1));
-        Some(ui::layout_toolbar(sel, mon, self.scale()))
+        // The monitor the edge it goes on is on.
+        use prism_core::settings::ToolbarPlace as P;
+        let y = match self.toolbar_place {
+            P::AboveLeft | P::AboveCenter | P::AboveRight => sel.y,
+            P::Left | P::Right => sel.y + sel.h / 2,
+            _ => sel.bottom().min(self.bounds.bottom() - 1),
+        };
+        let mon = self.monitor_of(sel.x + sel.w / 2, y);
+        Some(ui::layout_toolbar(sel, mon, self.scale(), self.toolbar_place))
     }
 
     fn palette_layout(&self, tb: &ui::ToolbarLayout) -> Option<ui::PaletteLayout> {
@@ -445,7 +501,7 @@ impl Overlay {
         }
         let anchor = tb.buttons.iter().find(|(b, _)| *b == Btn::Color).map(|(_, r)| *r)?;
         let mon = self.monitor_of(anchor.x, anchor.y);
-        Some(ui::layout_palette(anchor, tb.above, &self.palette, mon, self.scale()))
+        Some(ui::layout_palette(anchor, tb.opens, &self.palette, mon, self.scale()))
     }
 
     fn handle_at(&self, x: i32, y: i32) -> Option<Handle> {
@@ -490,7 +546,19 @@ impl Overlay {
         let gap = (6.0 * s) as i32;
         let y = if sel.y - gap - h >= self.monitor_of(sel.x, sel.y).y { sel.y - gap - h } else { sel.y + gap };
         let x = sel.x.max(self.monitor_of(sel.x, sel.y).x);
-        Some((IRect::new(x, y, w, h), label))
+        let mut r = IRect::new(x, y, w, h);
+        // The toolbar may sit where the label goes: then the label goes under the region, or
+        // just inside its bottom edge.
+        if let Some(tb) = self.toolbar().filter(|tb| !tb.panel.intersect(&r.inflate(gap)).is_empty()) {
+            let mon = self.monitor_of(sel.x, sel.bottom().min(self.bounds.bottom() - 1));
+            let below = IRect::new(x, sel.bottom() + gap, w, h);
+            r = if below.bottom() <= mon.bottom() && tb.panel.intersect(&below.inflate(gap)).is_empty() {
+                below
+            } else {
+                IRect::new(x + gap, sel.bottom() - gap - h, w, h)
+            };
+        }
+        Some((r, label))
     }
 
     fn drag_is_none(&self) -> bool {
@@ -512,8 +580,10 @@ impl Overlay {
             r = r.union(&m.inflate(pad));
         }
         if let Some(tb) = self.toolbar() {
-            // Tooltips and the palette can appear on either side; cover a band around it.
-            r = r.union(&tb.panel.inflate((70.0 * s) as i32));
+            r = r.union(&tb.panel.inflate(pad));
+            if let Some((t, _)) = self.tooltip(&tb) {
+                r = r.union(&t.inflate(pad));
+            }
             if let Some(p) = self.palette_layout(&tb) {
                 r = r.union(&p.panel.inflate(pad));
             }
@@ -533,14 +603,97 @@ impl Overlay {
         self.invalidate(dirty);
     }
 
-    fn invalidate(&self, r: IRect) {
+    fn invalidate(&mut self, r: IRect) {
+        let r = r.intersect(&self.bounds);
         if r.is_empty() {
+            return;
+        }
+        if self.layered {
+            // A layered window gets no WM_PAINT: compose and hand the frame over now.
+            if self.scratch_stale {
+                self.update_scratch();
+            }
+            self.compose(r);
+            let _ = self.present(r);
             return;
         }
         let rc = RECT { left: r.x, top: r.y, right: r.right(), bottom: r.bottom() };
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), Some(&rc), false);
         }
+    }
+
+    /// Show the back buffer's `dirty` part on the layered window.
+    fn present(&self, dirty: IRect) -> bool {
+        let size = SIZE { cx: self.bounds.w, cy: self.bounds.h };
+        let (src, dst) = (POINT { x: 0, y: 0 }, POINT { x: self.origin.0, y: self.origin.1 });
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let rc = RECT { left: dirty.x, top: dirty.y, right: dirty.right(), bottom: dirty.bottom() };
+        let info = UPDATELAYEREDWINDOWINFO {
+            cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+            hdcDst: HDC::default(),
+            pptDst: &dst,
+            psize: &size,
+            hdcSrc: self.back.dc,
+            pptSrc: &src,
+            crKey: Default::default(),
+            pblend: &blend,
+            dwFlags: ULW_ALPHA,
+            prcDirty: &rc,
+        };
+        unsafe {
+            let _ = GdiFlush();
+            UpdateLayeredWindowIndirect(self.hwnd, &info).as_bool()
+        }
+    }
+
+    /// Live: capture the screen now, as it is under the overlay, and carry on as if it had been
+    /// captured when the overlay opened. Does nothing once frozen.
+    fn freeze(&mut self) {
+        if !self.live {
+            return;
+        }
+        let vs = IRect::new(self.origin.0, self.origin.1, self.bounds.w, self.bounds.h);
+        let grabbed = if self.unseen {
+            capture::grab(vs, self.capture_cursor)
+        } else {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+                let g = capture::grab(vs, self.capture_cursor);
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+                g
+            }
+        };
+        // If it can't be captured, an empty screen is better than a frozen overlay.
+        let base = grabbed.filter(|b| b.w as i32 == vs.w && b.h as i32 == vs.h).unwrap_or_else(|| Image::new(vs.w as u32, vs.h as u32));
+        self.dim = base.dimmed(DIM_KEEP);
+        self.committed = base.clone();
+        self.base = base;
+        self.live = false;
+        // From here every pixel is drawn opaque, so the whole window needs drawing once.
+        self.last_bounds = self.bounds;
+    }
+
+    /// Live, keep a copy of the pixels around the pointer for the magnifier.
+    fn sample_under_cursor(&mut self) {
+        if !self.live || !self.magnifier {
+            return;
+        }
+        let half = MAG_CELLS as i32 / 2;
+        let area = IRect::new(self.mouse.0 - half + self.origin.0, self.mouse.1 - half + self.origin.1, MAG_CELLS as i32, MAG_CELLS as i32);
+        if let Some(img) = capture::grab_quick(area) {
+            self.sample = img;
+        }
+    }
+
+    /// The colour of the screen at `(x, y)`, live or captured.
+    fn rgb_at(&self, x: i32, y: i32) -> Option<(u8, u8, u8)> {
+        if self.live {
+            let half = MAG_CELLS as i32 / 2;
+            return self.sample.rgb_at(x - self.mouse.0 + half, y - self.mouse.1 + half);
+        }
+        self.base.rgb_at(x, y)
     }
 
     // ---------- layers ----------
@@ -668,6 +821,25 @@ impl Overlay {
         let w = self.bounds.w as u32;
         let mut pm = self.back_pixmap();
         let back = pm.data_mut();
+        if self.live {
+            // The desktop shows through: a see-through black for the dim, nearly clear over the
+            // bright area. Never fully clear, or clicks there would go to the window beneath.
+            let fill = |back: &mut [u8], area: IRect, keep: u16| {
+                let a = (256 - keep).min(255) as u8;
+                for y in area.y..area.bottom() {
+                    let row = (y as usize * w as usize + area.x as usize) * 4;
+                    for px in back[row..row + area.w as usize * 4].chunks_exact_mut(4) {
+                        px.copy_from_slice(&[0, 0, 0, a]);
+                    }
+                }
+            };
+            fill(back, r, DIM_KEEP);
+            if let Some(area) = self.bright().map(|b| b.intersect(&r)).filter(|a| !a.is_empty()) {
+                fill(back, area, if self.hovering() { HOVER_KEEP } else { 255 });
+            }
+            self.draw_chrome(&mut pm);
+            return;
+        }
         copy_rect(&self.dim.data, w, r, back, w, r.x, r.y);
         if let Some(b) = self.bright() {
             let area = b.intersect(&r);
@@ -679,20 +851,36 @@ impl Overlay {
                 } else {
                     copy_rect(&self.committed.data, w, area, back, w, area.x, area.y);
                 }
+                if self.hovering() {
+                    for y in area.y..area.bottom() {
+                        let row = (y as usize * w as usize + area.x as usize) * 4;
+                        prism_core::image::dim_in_place(&mut back[row..row + area.w as usize * 4], HOVER_KEEP);
+                    }
+                }
             }
         }
         self.draw_chrome(&mut pm);
     }
 
+    /// Whether nothing is chosen yet, so the bright area is just what a click would pick.
+    fn hovering(&self) -> bool {
+        self.sel.is_none() && self.reselect_from.is_none() && !matches!(self.drag, Drag::NewSel { moved: true, .. })
+    }
+
+    fn frame_kind(&self) -> ui::Frame {
+        match &self.drag {
+            _ if self.hovering() => ui::Frame::Hover,
+            Drag::NewSel { moved: true, .. } | Drag::Resize { .. } | Drag::MoveSel { .. } => ui::Frame::Dragging,
+            Drag::Draw { .. } => ui::Frame::Plain,
+            _ if self.mode != Mode::Capture || self.editing.is_some() || self.sel.is_none() => ui::Frame::Plain,
+            _ => ui::Frame::Chosen,
+        }
+    }
+
     fn draw_chrome(&self, pm: &mut PixmapMut) {
         let s = self.scale();
         if let Some(b) = self.bright() {
-            ui::selection_border(pm, b, s);
-            if self.sel.is_some() && self.mode == Mode::Capture && self.editing.is_none() && !matches!(self.drag, Drag::Draw { .. }) {
-                if let Some(sel) = self.sel {
-                    ui::draw_handles(pm, sel, s);
-                }
-            }
+            ui::selection_frame(pm, b, self.frame_kind(), s);
         }
         if let (Some(i), Some(_)) = (self.selected_shape, self.sel) {
             let shape = match &self.drag {
@@ -778,19 +966,24 @@ impl Overlay {
             }
             ui::fill_toggle(pm, p.fill, self.style.fill, self.style.color, s);
         }
-        if let Some(btn) = self.hover_btn {
-            if let Some((_, r)) = tb.buttons.iter().find(|(b, _)| *b == btn) {
-                let tip = if btn == Btn::Width { format!("Size {}  scroll wheel", self.style.width as i32) } else { btn.tooltip(&self.tool_keys) };
-                let (w, h) = ui::pill_size(&self.text, &tip, s);
-                let gap = (8.0 * s) as i32;
-                let y = if tb.above { tb.panel.y - gap - h } else { tb.panel.bottom() + gap };
-                let mon = self.monitor_of(r.x, r.y);
-                let x = (r.x + r.w / 2 - w / 2).clamp(mon.x + 2, mon.right() - w - 2);
-                if !self.palette_open {
-                    ui::pill(pm, &self.text, &tip, x, y, s);
-                }
-            }
+        if let Some((r, tip)) = self.tooltip(tb) {
+            ui::pill(pm, &self.text, &tip, r.x, r.y, s);
         }
+    }
+
+    /// The hovered button's tooltip and where it goes: just off the toolbar, away from the region.
+    fn tooltip(&self, tb: &ui::ToolbarLayout) -> Option<(IRect, String)> {
+        let btn = self.hover_btn.filter(|_| !self.palette_open)?;
+        let (_, r) = tb.buttons.iter().find(|(b, _)| *b == btn)?;
+        let s = self.scale();
+        let tip = if btn == Btn::Width { format!("Size {}  scroll wheel", self.style.width as i32) } else { btn.tooltip(&self.tool_keys) };
+        let (w, h) = ui::pill_size(&self.text, &tip, s);
+        let anchor = match tb.opens {
+            ui::Side::Above | ui::Side::Below => IRect::new(r.x, tb.panel.y, r.w, tb.panel.h),
+            ui::Side::Left | ui::Side::Right => IRect::new(tb.panel.x, r.y, tb.panel.w, r.h),
+        };
+        let mon = self.monitor_of(r.x, r.y);
+        Some((ui::beside(anchor, tb.opens, w, h, (8.0 * s) as i32, mon), tip))
     }
 
     fn draw_magnifier(&self, pm: &mut PixmapMut, r: IRect, s: f32) {
@@ -805,7 +998,7 @@ impl Overlay {
             for j in 0..MAG_CELLS as i32 {
                 for i in 0..MAG_CELLS as i32 {
                     let (sx, sy) = (self.mouse.0 - half + i, self.mouse.1 - half + j);
-                    let (b, g, rr) = match self.base.rgb_at(sx, sy) {
+                    let (b, g, rr) = match self.rgb_at(sx, sy) {
                         Some((r_, g_, b_)) => (b_, g_, r_),
                         None => (20, 20, 24),
                     };
@@ -838,7 +1031,7 @@ impl Overlay {
         ui::stroke_rrect(pm, c, 0.0, 1.0, Rgba::WHITE);
         ui::stroke_rrect(pm, area, 0.0, 1.0, ui::PANEL_BORDER);
         let (sx, sy) = (self.mouse.0 + self.origin.0, self.mouse.1 + self.origin.1);
-        let color = self.base.rgb_at(self.mouse.0, self.mouse.1).unwrap_or((0, 0, 0));
+        let color = self.rgb_at(self.mouse.0, self.mouse.1).unwrap_or((0, 0, 0));
         let hex = format!("#{:02X}{:02X}{:02X}", color.0, color.1, color.2);
         let ty = area.bottom() + (5.0 * s) as i32;
         let px = 11.5 * s;
@@ -889,6 +1082,7 @@ impl Overlay {
     fn act(&mut self, what: Btn) {
         if self.sel.is_none() {
             // Acting before choosing: use the window or monitor under the cursor.
+            self.freeze();
             self.sel = self.hover_window;
         }
         let Some(img) = self.result_image() else { return };
@@ -907,6 +1101,7 @@ impl Overlay {
             return self.act_enter();
         }
         if self.sel.is_none() {
+            self.freeze();
             self.sel = self.hover_window;
         }
         if let Some(sel) = self.sel {
@@ -930,6 +1125,7 @@ impl Overlay {
     fn act_enter(&mut self) {
         use prism_core::settings::EnterAction;
         if self.sel.is_none() {
+            self.freeze();
             self.sel = self.hover_window;
         }
         let Some(img) = self.result_image() else { return };
@@ -1026,12 +1222,12 @@ impl Overlay {
             self.refresh();
         }
         let Some(sel) = self.sel else {
-            self.drag = Drag::NewSel { start: (x, y), moved: false };
+            self.drag = Drag::NewSel { start: (x, y), moved: false, inner: false };
             self.refresh();
             return;
         };
         if self.mode == Mode::Text {
-            self.drag = Drag::NewSel { start: (x, y), moved: false };
+            self.drag = Drag::NewSel { start: (x, y), moved: false, inner: false };
             return;
         }
         if let Some(h) = self.handle_at(x, y) {
@@ -1049,36 +1245,34 @@ impl Overlay {
             }
         }
         let inside = sel.contains(x, y);
-        if !inside && self.tool != Tool::Select {
-            // Drawing tools draw only inside the region. Outside, they choose a new region, and
-            // the tool is still in hand inside it. Select keeps moving and picking shapes.
+        if !inside {
+            // Every tool works only inside the region. A drag outside chooses a new region, with
+            // the same tool still in hand; a click outside keeps the region as it was.
             self.selected_shape = None;
             self.palette_open = false;
             self.reselect_from = self.sel.take();
-            self.drag = Drag::NewSel { start: (x, y), moved: false };
+            self.drag = Drag::NewSel { start: (x, y), moved: false, inner: false };
             self.refresh();
             return;
         }
         match self.tool {
+            Tool::Select if inside && key_down(VK_SHIFT.0) => {
+                // Shift+drag inside the region chooses a new one within it, instead of moving it.
+                self.selected_shape = None;
+                self.reselect_from = self.sel.take();
+                self.drag = Drag::NewSel { start: (x, y), moved: false, inner: true };
+            }
             Tool::Select => {
                 let tol = 4.0 * self.scale();
-                if let Some(i) = self.doc.hit(p, tol).filter(|_| inside) {
+                if let Some(i) = self.doc.hit(p, tol) {
                     let s = (*self.doc.shapes()[i]).clone();
                     self.selected_shape = Some(i);
                     self.drag = Drag::MoveShape { idx: i, start: p, orig: s.clone(), cur: s, lifted: false };
-                } else if inside {
-                    self.selected_shape = None;
-                    self.drag = Drag::MoveSel { start: (x, y), orig: sel };
-                } else if self.doc.is_empty() {
-                    // Start over with a new region.
-                    self.selected_shape = None;
-                    self.sel = None;
-                    self.drag = Drag::NewSel { start: (x, y), moved: false };
                 } else {
                     self.selected_shape = None;
+                    self.drag = Drag::MoveSel { start: (x, y), orig: sel };
                 }
             }
-            _ if !inside => {}
             Tool::Text => self.start_text(p),
             tool => {
                 self.selected_shape = None;
@@ -1109,6 +1303,7 @@ impl Overlay {
         }
         self.mouse = (x, y);
         let p = Pt::new(x as f32, y as f32);
+        self.sample_under_cursor();
         let shift = key_down(VK_SHIFT.0);
         let bounds = self.bounds;
         match &mut self.drag {
@@ -1117,7 +1312,7 @@ impl Overlay {
                 let hb = self.toolbar().and_then(|tb| tb.buttons.iter().find(|(_, r)| r.contains(x, y)).map(|(b, _)| *b));
                 self.hover_btn = hb;
             }
-            Drag::NewSel { start, moved } => {
+            Drag::NewSel { start, moved, .. } => {
                 if !*moved && ((x - start.0).abs() > 3 || (y - start.1).abs() > 3) {
                     *moved = true;
                 }
@@ -1183,15 +1378,19 @@ impl Overlay {
 
     fn on_mouse_up(&mut self, x: i32, y: i32) {
         self.mouse = (x, y);
+        // Take the drag before releasing the mouse: ReleaseCapture sends WM_CAPTURECHANGED
+        // straight away, and with a drag still set that handler would run this again, nested.
+        // If the nested run finished the capture, the overlay would be freed under this one.
+        let drag = std::mem::replace(&mut self.drag, Drag::None);
         unsafe {
             let _ = ReleaseCapture();
         }
-        let drag = std::mem::replace(&mut self.drag, Drag::None);
         match drag {
-            Drag::NewSel { start, moved } => {
+            Drag::NewSel { start, moved, inner } => {
                 let picked =
                     if moved { IRect::spanning(start.0, start.1, x, y).intersect(&self.bounds) } else { self.hover_window.unwrap_or_default() };
                 if picked.w >= 2 && picked.h >= 2 {
+                    self.freeze();
                     self.sel = Some(picked);
                     self.reselect_from = None;
                     self.hover_window = None;
@@ -1200,7 +1399,9 @@ impl Overlay {
                         self.finish(Outcome::Ocr(img));
                         return;
                     }
-                    if self.quick_finish_held() {
+                    // Shift was held to start this region, not to finish it.
+                    let shift_was_for_inner = inner && self.quick_finish == prism_core::settings::QuickFinish::Shift;
+                    if self.quick_finish_held() && !shift_was_for_inner {
                         self.act_enter();
                         return;
                     }
@@ -1333,11 +1534,12 @@ impl Overlay {
                 if self.palette_open {
                     self.palette_open = false;
                 } else if !self.drag_is_none() {
-                    // Cancel the drag in progress.
+                    // Cancel the drag in progress. Clear it first, so the WM_CAPTURECHANGED
+                    // that ReleaseCapture sends doesn't finish the drag instead.
+                    self.drag = Drag::None;
                     unsafe {
                         let _ = ReleaseCapture();
                     }
-                    self.drag = Drag::None;
                     self.scratch_live = false;
                     if let Some(previous) = self.reselect_from.take() {
                         self.sel = Some(previous);
@@ -1366,6 +1568,7 @@ impl Overlay {
             v if ctrl && v == b'S' as u16 => {
                 if shift {
                     if self.sel.is_none() {
+                        self.freeze();
                         self.sel = self.hover_window;
                     }
                     if let Some(img) = self.result_image() {
@@ -1381,6 +1584,7 @@ impl Overlay {
             }
             v if ctrl && v == b'Y' as u16 => self.redo(),
             v if ctrl && v == b'A' as u16 => {
+                self.freeze();
                 self.sel = Some(self.bounds);
                 self.hover_window = None;
             }
@@ -1432,11 +1636,13 @@ impl Overlay {
         }
         match ch.to_ascii_uppercase() {
             'C' if self.sel.is_none() || matches!(self.drag, Drag::NewSel { .. }) => {
+                self.freeze();
                 if let Some((r, g, b)) = self.base.rgb_at(self.mouse.0, self.mouse.1) {
                     self.finish(Outcome::Color(Rgba::rgb(r, g, b)));
                 }
             }
             'F' if self.sel.is_none() => {
+                self.freeze();
                 self.sel = Some(self.monitor_of(self.mouse.0, self.mouse.1));
                 self.hover_window = None;
                 if self.mode == Mode::Text {
@@ -1485,12 +1691,11 @@ impl Overlay {
             return handle_cursor(h);
         }
         if !sel.contains(x, y) {
-            return if self.tool != Tool::Select || self.doc.is_empty() { IDC_CROSS } else { IDC_ARROW };
+            return IDC_CROSS;
         }
         match self.tool {
-            Tool::Select => {
-                if self.doc.hit(Pt::new(x as f32, y as f32), 4.0 * self.scale()).is_some() { IDC_SIZEALL } else { IDC_SIZEALL }
-            }
+            Tool::Select if key_down(VK_SHIFT.0) => IDC_CROSS,
+            Tool::Select => IDC_SIZEALL,
             Tool::Text => IDC_IBEAM,
             _ => IDC_CROSS,
         }
@@ -1583,7 +1788,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 LRESULT(0)
             }
+            WM_KEYUP if wp.0 as u16 == VK_SHIFT.0 => {
+                SetCursor(LoadCursorW(None, ov.cursor()).ok());
+                LRESULT(0)
+            }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
+                if wp.0 as u16 == VK_SHIFT.0 {
+                    // Shift changes what a drag in the region does: show it straight away.
+                    SetCursor(LoadCursorW(None, ov.cursor()).ok());
+                }
                 if ov.on_key(wp.0 as u16) {
                     LRESULT(0)
                 } else {
@@ -1668,15 +1881,56 @@ pub fn render_offscreen(script: &str) -> Option<Image> {
         auto_tool: None,
         reselect_from: None,
         tool_keys: Default::default(),
+        toolbar_place: Default::default(),
+        layered: false,
+        live: false,
+        unseen: false,
+        capture_cursor: false,
+        sample: Image::new(0, 0),
         text: GdiText::new(),
         last_bounds: IRect::default(),
     };
     let (cx, cy) = (w as i32 / 2, h as i32 / 2);
     match script {
         "hover" => ov.update_hover(),
-        "selecting" => {
-            ov.drag = Drag::NewSel { start: (cx - 400, cy - 250), moved: true };
+        // Live: the see-through frame, shown over the screen as Windows would show it.
+        "live-hover" => {
+            ov.live = true;
+            ov.layered = true;
+            ov.update_hover();
+            ov.sample_under_cursor();
+        }
+        "live-selecting" => {
+            ov.live = true;
+            ov.layered = true;
+            ov.drag = Drag::NewSel { start: (cx - 400, cy - 250), moved: true, inner: false };
             ov.mouse = (cx + 300, cy + 200);
+            ov.sample_under_cursor();
+        }
+        "selecting" => {
+            ov.drag = Drag::NewSel { start: (cx - 400, cy - 250), moved: true, inner: false };
+            ov.mouse = (cx + 300, cy + 200);
+        }
+        "chosen" => {
+            ov.sel = Some(IRect::new(cx - 400, cy - 250, 700, 450));
+            ov.mouse = (cx + 600, cy + 300);
+        }
+        // "toolbar-<place>", e.g. toolbar-left: a region with the toolbar there, a tooltip and
+        // the palette open.
+        place if place.starts_with("toolbar-") => {
+            use prism_core::settings::ToolbarPlace as P;
+            ov.toolbar_place = match &place[8..] {
+                "above-left" => P::AboveLeft,
+                "above-center" => P::AboveCenter,
+                "above-right" => P::AboveRight,
+                "left" => P::Left,
+                "right" => P::Right,
+                "below-left" => P::BelowLeft,
+                "below-center" => P::BelowCenter,
+                _ => P::BelowRight,
+            };
+            ov.sel = Some(IRect::new(cx - 400, cy - 250, 700, 450));
+            ov.hover_btn = Some(Btn::Tool(Tool::Select));
         }
         "text-mode" => {
             ov.mode = Mode::Text;
@@ -1731,6 +1985,27 @@ pub fn render_offscreen(script: &str) -> Option<Image> {
     unsafe {
         let _ = GdiFlush();
     }
-    let data = unsafe { std::slice::from_raw_parts(ov.back.bits, len) }.to_vec();
+    let mut data = unsafe { std::slice::from_raw_parts(ov.back.bits, len) }.to_vec();
+    if ov.live {
+        // Check Windows takes the frame, on a layered window that's never shown.
+        register_class();
+        let class = wide(CLASS);
+        if let Ok(hwnd) = unsafe { CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, PCWSTR(class.as_ptr()), PCWSTR::null(), WS_POPUP, origin.0, origin.1, w as i32, h as i32, None, None, None, None) } {
+            ov.hwnd = hwnd;
+            let affinity = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) }.is_ok();
+            eprintln!("layered frame accepted: {}, kept out of captures: {affinity}", ov.present(ov.bounds));
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+        // What DWM would show: the premultiplied frame over the screen.
+        for (d, s) in data.chunks_exact_mut(4).zip(ov.base.data.chunks_exact(4)) {
+            let inv = 255 - d[3] as u32;
+            for c in 0..3 {
+                d[c] = (d[c] as u32 + s[c] as u32 * inv / 255).min(255) as u8;
+            }
+            d[3] = 255;
+        }
+    }
     Image::from_bgra(w, h, data)
 }
