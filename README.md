@@ -97,3 +97,7 @@ A macOS host would reuse `prism-core` as is. See [docs/ROADMAP.md](docs/ROADMAP.
 ## Privacy
 
 There's no network access, no account and no telemetry. Settings are in `%APPDATA%\Prism\settings.json`, and captures go only where you save or copy them.
+
+## Support
+
+Prism is free. If it saves you time, you can [support me on Ko-fi](https://ko-fi.com/beroris).
