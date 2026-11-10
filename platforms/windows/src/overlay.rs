@@ -734,11 +734,12 @@ impl Overlay {
         self.editing.as_ref().map(|e| self.text_shape(e))
     }
 
-    /// A highlighter stroke fitted to the text or object under it, unless Ctrl is held or
-    /// there's nothing to fit to. Other shapes come back as they are.
+    /// A highlighter stroke that starts on a word, fitted to the text or object under it.
+    /// Shift (a straight stroke) and Ctrl (freehand) leave it as drawn. Other shapes come back
+    /// as they are.
     fn snapped(&self, shape: Shape) -> Shape {
         let (Shape::Highlighter { pts, style }, Some(sel)) = (&shape, self.sel) else { return shape };
-        if key_down(VK_CONTROL.0) {
+        if key_down(VK_CONTROL.0) || key_down(VK_SHIFT.0) {
             return shape;
         }
         match prism_core::snap::highlight_boxes(&self.base, sel, pts, doc::highlighter_width(style.width)) {
@@ -1803,14 +1804,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 LRESULT(0)
             }
-            WM_KEYUP if wp.0 as u16 == VK_SHIFT.0 => {
-                SetCursor(LoadCursorW(None, ov.cursor()).ok());
-                LRESULT(0)
-            }
-            // Ctrl turns highlighter snapping off and on mid-stroke: show it straight away.
-            WM_KEYDOWN | WM_KEYUP if wp.0 as u16 == VK_CONTROL.0 && matches!(ov.drag, Drag::Draw { .. }) => {
+            // Shift and Ctrl turn highlighter snapping off and on mid-stroke: show it straight away.
+            WM_KEYDOWN | WM_KEYUP
+                if (wp.0 as u16 == VK_CONTROL.0 || wp.0 as u16 == VK_SHIFT.0) && matches!(ov.drag, Drag::Draw { .. }) =>
+            {
                 ov.scratch_stale = true;
                 ov.refresh();
+                LRESULT(0)
+            }
+            WM_KEYUP if wp.0 as u16 == VK_SHIFT.0 => {
+                SetCursor(LoadCursorW(None, ov.cursor()).ok());
                 LRESULT(0)
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {

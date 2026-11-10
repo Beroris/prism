@@ -9,10 +9,12 @@
 //!    differs from it clearly is ink.
 //! 2. Rows with ink under the stroke's span form runs, and each run is a line. Runs with tiny
 //!    gaps between them (the dot of an i, an accent) are one line.
-//! 3. Each line the stroke's centre crosses gets a box from its first to its last ink column
+//! 3. The stroke must start on one of those lines, on or right beside ink: on a word.
+//! 4. Each line the stroke's centre crosses gets a box from its first to its last ink column
 //!    under the stroke, carried out to the ends of the words at either end.
 //!
-//! When nothing fits (a photo, an empty area), there's no snap and the stroke stays as drawn.
+//! When it doesn't start on a word, or nothing fits (a photo, an empty area), there's no snap
+//! and the stroke stays as drawn.
 
 use crate::geom::{FRect, IRect, Pt};
 use crate::image::Image;
@@ -67,6 +69,19 @@ pub fn highlight_boxes(img: &Image, clip: IRect, pts: &[Pt], brush: f32) -> Opti
     }
     let lines = merge_close(runs);
 
+    // 3. Only a stroke that starts on a word snaps. One started beside or between things is meant
+    // to be drawn as it is, even if it crosses text later.
+    let (sx, sy) = (pts[0].x.round() as i32, pts[0].y.round() as i32);
+    let &(top, bottom) = lines.iter().find(|&&(a, b)| {
+        let slack = ((b - a) / 4).max(2);
+        sy >= a - slack && sy < b + slack
+    })?;
+    let reach = word_gap(bottom - top);
+    let near = (sx - reach).max(clip.x)..=(sx + reach).min(clip.right() - 1);
+    if !near.into_iter().any(|x| (top..bottom).any(|y| ink(x, y))) {
+        return None;
+    }
+
     // The lines the stroke's centre passes through, or else the nearest within its width.
     let (cy0, cy1) = (span.t - 2.0, span.b + 2.0);
     let mut chosen: Vec<(i32, i32)> = lines.iter().copied().filter(|&(a, b)| (b as f32) > cy0 && (a as f32) <= cy1).collect();
@@ -79,7 +94,7 @@ pub fn highlight_boxes(img: &Image, clip: IRect, pts: &[Pt], brush: f32) -> Opti
         return None;
     }
 
-    // 3. A box per line.
+    // 4. A box per line.
     let mut boxes = Vec::with_capacity(chosen.len());
     for (top, bottom) in chosen {
         let h = bottom - top;
@@ -91,10 +106,8 @@ pub fn highlight_boxes(img: &Image, clip: IRect, pts: &[Pt], brush: f32) -> Opti
         }
         let col = |x: i32| (top..bottom).any(|y| ink(x, y));
         let (Some(first), Some(last)) = ((x0..=x1).find(|&x| col(x)), (x0..=x1).rev().find(|&x| col(x))) else { continue };
-        // A space is wider than the gap between letters; stop at the first one.
-        let word_gap = ((h as f32 * 0.3).round() as i32).max(3);
-        let l = extend(first, -1, clip.x, word_gap, &col);
-        let r = extend(last, 1, clip.right() - 1, word_gap, &col);
+        let l = extend(first, -1, clip.x, word_gap(h), &col);
+        let r = extend(last, 1, clip.right() - 1, word_gap(h), &col);
         if h >= PICTURE_H && px.colors(l, r, top, bottom) > PICTURE_COLORS {
             return None;
         }
@@ -183,6 +196,12 @@ fn background(px: &Pixels, x0: i32, x1: i32, y0: i32, y1: i32) -> Option<[u8; 3]
     (*n > 0).then(|| sum[k].map(|s| (s / n) as u8))
 }
 
+/// The narrowest gap that ends a word on a line `h` pixels tall. A space is wider than the gap
+/// between letters.
+fn word_gap(h: i32) -> i32 {
+    ((h as f32 * 0.3).round() as i32).max(3)
+}
+
 /// Join runs split by gaps small for their size, like the dot above an i.
 fn merge_close(runs: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
     let mut out: Vec<(i32, i32)> = Vec::with_capacity(runs.len());
@@ -260,6 +279,21 @@ mod tests {
         assert!(b.l > 6.0 && b.l <= 10.0, "starts at the first word: {b:?}");
         assert!(b.r >= 73.0 && b.r < 78.0, "ends with the second word: {b:?}");
         assert!(b.t > 15.0 && b.t <= 20.0 && b.b >= 32.0 && b.b < 37.0, "fits the line: {b:?}");
+    }
+
+    #[test]
+    fn only_a_stroke_started_on_a_word_snaps() {
+        let mut blocks = word(40, 20, 4);
+        blocks.extend(word(40, 60, 4));
+        let img = page(200, 100, &blocks);
+        // Started in the margin left of the word, then dragged across it.
+        assert!(highlight_boxes(&img, img.bounds(), &stroke(10.0, 70.0, 26.0), 16.0).is_none());
+        // Started past its end, dragged back over it.
+        assert!(highlight_boxes(&img, img.bounds(), &stroke(120.0, 50.0, 26.0), 16.0).is_none());
+        // Started between the lines, then dragged down through one.
+        assert!(highlight_boxes(&img, img.bounds(), &[Pt::new(50.0, 45.0), Pt::new(52.0, 66.0)], 16.0).is_none());
+        // Started on the word, dragged back the other way.
+        assert!(highlight_boxes(&img, img.bounds(), &stroke(60.0, 10.0, 26.0), 16.0).is_some());
     }
 
     #[test]

@@ -175,6 +175,11 @@ impl Btn {
     pub fn tooltip(self, keys: &prism_core::doc::ToolKeys) -> String {
         match self {
             Btn::Tool(Tool::Select) => format!("{}  {}   Shift+drag for a new region", Tool::Select.label(), keys.key(Tool::Select)),
+            Btn::Tool(Tool::Highlighter) => format!(
+                "{}  {}   Start on a word to snap to it, hold Shift or Ctrl not to",
+                Tool::Highlighter.label(),
+                keys.key(Tool::Highlighter)
+            ),
             Btn::Tool(t) => format!("{}  {}", t.label(), keys.key(t)),
             Btn::Color => "Colour  1–8".into(),
             Btn::Width => "Size  scroll wheel".into(),
