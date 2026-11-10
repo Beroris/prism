@@ -120,6 +120,13 @@ impl FRect {
     pub fn inflate(&self, d: f32) -> FRect {
         FRect { l: self.l - d, t: self.t - d, r: self.r + d, b: self.b + d }
     }
+    pub fn offset(&self, dx: f32, dy: f32) -> FRect {
+        FRect { l: self.l + dx, t: self.t + dy, r: self.r + dx, b: self.b + dy }
+    }
+    /// The smallest rectangle holding both.
+    pub fn union(&self, o: &FRect) -> FRect {
+        FRect { l: self.l.min(o.l), t: self.t.min(o.t), r: self.r.max(o.r), b: self.b.max(o.b) }
+    }
     pub fn contains(&self, p: Pt) -> bool {
         p.x >= self.l && p.x <= self.r && p.y >= self.t && p.y <= self.b
     }

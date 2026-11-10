@@ -6,7 +6,7 @@
 
 use crate::color::Rgba;
 use crate::doc::{Shape, Style, arrow_head, counter_radius, highlighter_width, text_px};
-use crate::geom::{IRect, Pt};
+use crate::geom::{FRect, IRect, Pt};
 use crate::image::{blur_region, pixelate_region};
 use tiny_skia::{BlendMode, Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, PixmapMut, Rect, Stroke, Transform};
 
@@ -108,6 +108,17 @@ impl<'a> Canvas<'a> {
                 let c = style.color.with_alpha(HIGHLIGHT_ALPHA);
                 self.polyline(pts, c, highlighter_width(style.width), BlendMode::SourceOver, t)
             }
+            Shape::Highlight { rects, style } => {
+                // All the boxes are one path, so where two touch they don't build up.
+                let mut pb = PathBuilder::new();
+                for r in rects {
+                    round_rect(&mut pb, *r, (r.h() / 5.0).clamp(1.0, 4.0));
+                }
+                if let Some(path) = pb.finish() {
+                    let c = style.color.with_alpha(HIGHLIGHT_ALPHA);
+                    self.pixmap.fill_path(&path, &paint(c), FillRule::Winding, t, None);
+                }
+            }
             Shape::Text { pos, text: s, style, .. } => {
                 if let Some(mask) = text.raster(s, text_px(style.width), false) {
                     let (x, y) = (pos.x.round() as i32 - self.origin.0, pos.y.round() as i32 - self.origin.1);
@@ -200,6 +211,26 @@ impl<'a> Canvas<'a> {
     }
 }
 
+/// Add a rounded rectangle to `pb`, clockwise like every other one so they join up.
+fn round_rect(pb: &mut PathBuilder, r: FRect, rad: f32) {
+    if r.w() <= 0.0 || r.h() <= 0.0 {
+        return;
+    }
+    let k = rad.min(r.w() / 2.0).min(r.h() / 2.0);
+    // Control points for a quarter circle drawn as one cubic.
+    let c = k * 0.4477;
+    pb.move_to(r.l + k, r.t);
+    pb.line_to(r.r - k, r.t);
+    pb.cubic_to(r.r - c, r.t, r.r, r.t + c, r.r, r.t + k);
+    pb.line_to(r.r, r.b - k);
+    pb.cubic_to(r.r, r.b - c, r.r - c, r.b, r.r - k, r.b);
+    pb.line_to(r.l + k, r.b);
+    pb.cubic_to(r.l + c, r.b, r.l, r.b - c, r.l, r.b - k);
+    pb.line_to(r.l, r.t + k);
+    pb.cubic_to(r.l, r.t + c, r.l + c, r.t, r.l + k, r.t);
+    pb.close();
+}
+
 /// Composite `color` through an 8-bit coverage mask with its top-left at (x, y).
 pub fn blend_mask(pm: &mut PixmapMut, x: i32, y: i32, mask: &TextMask, color: Rgba) {
     let (w, h) = (pm.width() as i32, pm.height() as i32);
@@ -284,6 +315,18 @@ mod tests {
         assert!(r > 60 && r < 160 && b < 40, "tinted but dark: {r},{g},{b}");
         let (r, g, b) = img.rgb_at(10, 20).unwrap();
         assert!(r == 255 && g > 220 && b < 200, "yellow on white: {r},{g},{b}");
+    }
+
+    #[test]
+    fn touching_highlight_boxes_do_not_build_up() {
+        let mut img = white(40, 40);
+        let style = Style { color: Rgba::YELLOW, width: 4.0, fill: false };
+        let rects = vec![FRect { l: 5.0, t: 5.0, r: 30.0, b: 20.0 }, FRect { l: 5.0, t: 15.0, r: 30.0, b: 35.0 }];
+        let mut c = Canvas::new(&mut img.data, 40, 40, (0, 0)).unwrap();
+        c.draw(&Shape::Highlight { rects, style }, &NoText);
+        assert_eq!(img.rgb_at(15, 10), img.rgb_at(15, 17), "the overlap is no darker");
+        assert_ne!(img.rgb_at(15, 10), Some((255, 255, 255)));
+        assert_eq!(img.rgb_at(35, 10), Some((255, 255, 255)));
     }
 
     #[test]

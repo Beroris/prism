@@ -727,11 +727,24 @@ impl Overlay {
     /// The shape currently drawn live (being drawn, moved or typed), if any.
     fn live_shape(&self) -> Option<Shape> {
         match &self.drag {
-            Drag::Draw { shape, .. } => return Some(shape.clone()),
+            Drag::Draw { shape, .. } => return Some(self.snapped(shape.clone())),
             Drag::MoveShape { cur, lifted: true, .. } => return Some(cur.clone()),
             _ => {}
         }
         self.editing.as_ref().map(|e| self.text_shape(e))
+    }
+
+    /// A highlighter stroke fitted to the text or object under it, unless Ctrl is held or
+    /// there's nothing to fit to. Other shapes come back as they are.
+    fn snapped(&self, shape: Shape) -> Shape {
+        let (Shape::Highlighter { pts, style }, Some(sel)) = (&shape, self.sel) else { return shape };
+        if key_down(VK_CONTROL.0) {
+            return shape;
+        }
+        match prism_core::snap::highlight_boxes(&self.base, sel, pts, doc::highlighter_width(style.width)) {
+            Some(rects) => Shape::Highlight { rects, style: *style },
+            None => shape,
+        }
     }
 
     fn text_shape(&self, e: &TextEdit) -> Shape {
@@ -1353,7 +1366,8 @@ impl Overlay {
                         }
                     }
                     Shape::Counter { center, .. } => *center = p,
-                    Shape::Text { .. } => {}
+                    // Only made from a finished highlighter stroke, never drawn directly.
+                    Shape::Text { .. } | Shape::Highlight { .. } => {}
                 }
                 self.scratch_stale = true;
             }
@@ -1417,6 +1431,7 @@ impl Overlay {
                 }
             }
             Drag::Draw { shape, .. } => {
+                let shape = self.snapped(shape);
                 self.commit_shape(shape);
                 self.scratch_live = false;
             }
@@ -1792,6 +1807,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 SetCursor(LoadCursorW(None, ov.cursor()).ok());
                 LRESULT(0)
             }
+            // Ctrl turns highlighter snapping off and on mid-stroke: show it straight away.
+            WM_KEYDOWN | WM_KEYUP if wp.0 as u16 == VK_CONTROL.0 && matches!(ov.drag, Drag::Draw { .. }) => {
+                ov.scratch_stale = true;
+                ov.refresh();
+                LRESULT(0)
+            }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 if wp.0 as u16 == VK_SHIFT.0 {
                     // Shift changes what a drag in the region does: show it straight away.
@@ -1935,6 +1956,23 @@ pub fn render_offscreen(script: &str) -> Option<Image> {
         "text-mode" => {
             ov.mode = Mode::Text;
             ov.update_hover();
+        }
+        // Highlighter strokes over whatever is on the screen, snapped as a real drag would be:
+        // short strokes every 40 px down the middle, and one stroke down across several lines.
+        "highlight" => {
+            let sel = IRect::new(cx - 450, cy - 280, 900, 560);
+            ov.sel = Some(sel);
+            let (x, y) = (sel.x as f32, sel.y as f32);
+            let st = Style { color: Rgba::YELLOW, width: 4.0, fill: false };
+            for i in 0..12 {
+                let yy = y + 30.0 + i as f32 * 40.0;
+                let pts = vec![Pt::new(x + 120.0, yy), Pt::new(x + 380.0, yy + 1.0)];
+                let s = ov.snapped(Shape::Highlighter { pts, style: st });
+                ov.commit_shape(s);
+            }
+            let pts = vec![Pt::new(x + 600.0, y + 100.0), Pt::new(x + 640.0, y + 260.0)];
+            let s = ov.snapped(Shape::Highlighter { pts, style: Style { color: Rgba::GREEN, ..st } });
+            ov.commit_shape(s);
         }
         _ => {
             // "annotated": a selection with one of each shape, the palette open and a tooltip.

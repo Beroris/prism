@@ -8,6 +8,7 @@ A small, fast screenshot and annotation tool for Windows. Press Print Screen, dr
 
 - **Region, window or screen.** Drag to select, or click to take the window under the cursor. Resize with the handles, or nudge with the arrow keys (Ctrl+arrows resize). F takes the whole monitor and Ctrl+A every monitor.
 - **Annotate in place.** Rectangle, ellipse, line, arrow, pen, highlighter, text, numbered steps, blur and pixelate. Eight colours with an optional fill, the scroll wheel for size, and Shift for straight lines and squares. Undo and redo, and the Select tool moves or deletes what you drew.
+- **A highlighter that snaps.** Drag it over text and it fits a neat box to each line, out to whole words. Click a word to mark just that word. It fits buttons and other things on the screen the same way, and stays a freehand stroke over photos and empty space. Hold Ctrl to draw freely.
 - **Live or frozen.** By default the screen freezes the moment you press the shortcut. Turn on live capture in Settings and videos keep playing while you choose, with the shot taken as you let go.
 - **The same region again.** Ctrl+Alt+O captures the region you captured last, straight away, so before-and-after shots line up. Ctrl+Alt+Shift+O opens it ready to mark up instead.
 - **Copy text (OCR).** Ctrl+Print Screen, select, and the text is on the clipboard. Inside the editor, press O. This uses the OCR engine built into Windows, so there's nothing to download.
@@ -36,6 +37,7 @@ A small, fast screenshot and annotation tool for Windows. Press Print Screen, dr
 | Scroll wheel | Change the size |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Delete | Delete the selected shape |
+| Ctrl while highlighting | Draw freely instead of snapping to text |
 | Right-click | Choose again before you draw; cancel while choosing |
 | Esc | Finish typing, then close |
 

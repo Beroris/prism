@@ -10,6 +10,7 @@ pub mod image;
 pub mod naming;
 pub mod render;
 pub mod settings;
+pub mod snap;
 pub mod update;
 
 pub use color::Rgba;

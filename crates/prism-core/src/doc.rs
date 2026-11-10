@@ -178,6 +178,8 @@ pub enum Shape {
     Arrow { a: Pt, b: Pt, style: Style },
     Pen { pts: Vec<Pt>, style: Style },
     Highlighter { pts: Vec<Pt>, style: Style },
+    /// A highlighter stroke snapped to what was under it: one box per line of text.
+    Highlight { rects: Vec<FRect>, style: Style },
     /// `w`/`h` are the measured size of the rendered text, kept for hit testing.
     Text { pos: Pt, text: String, style: Style, w: f32, h: f32 },
     Counter { center: Pt, n: u32, style: Style },
@@ -214,6 +216,7 @@ impl Shape {
             | Shape::Arrow { style, .. }
             | Shape::Pen { style, .. }
             | Shape::Highlighter { style, .. }
+            | Shape::Highlight { style, .. }
             | Shape::Text { style, .. }
             | Shape::Counter { style, .. } => Some(style),
             Shape::Blur { .. } | Shape::Pixelate { .. } => None,
@@ -229,6 +232,9 @@ impl Shape {
             Shape::Arrow { a, b, style } => FRect::spanning(*a, *b).inflate(arrow_head(style.width) + 2.0),
             Shape::Pen { pts, style } => FRect::of_points(pts).inflate(style.width / 2.0 + 2.0),
             Shape::Highlighter { pts, style } => FRect::of_points(pts).inflate(highlighter_width(style.width) / 2.0 + 2.0),
+            Shape::Highlight { rects, .. } => {
+                rects.iter().skip(1).fold(rects.first().copied().unwrap_or_default(), |a, r| a.union(r)).inflate(2.0)
+            }
             Shape::Text { pos, w, h, .. } => FRect { l: pos.x - 2.0, t: pos.y - 2.0, r: pos.x + w + 2.0, b: pos.y + h + 2.0 },
             Shape::Counter { center, style, .. } => {
                 let r = counter_radius(style.width) + 2.0;
@@ -262,6 +268,7 @@ impl Shape {
             Shape::Arrow { a, b, style } => dist_to_segment(p, *a, *b) <= style.width / 2.0 + tol + 2.0,
             Shape::Pen { pts, style } => polyline_hit(pts, p, style.width / 2.0 + tol),
             Shape::Highlighter { pts, style } => polyline_hit(pts, p, highlighter_width(style.width) / 2.0 + tol),
+            Shape::Highlight { rects, .. } => rects.iter().any(|r| r.inflate(tol).contains(p)),
             Shape::Text { .. } | Shape::Counter { .. } | Shape::Blur { .. } | Shape::Pixelate { .. } => {
                 self.bounds().inflate(tol).contains(p)
             }
@@ -280,6 +287,7 @@ impl Shape {
                 *b = b.add(dx, dy);
             }
             Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } => pts.iter_mut().for_each(|p| *p = p.add(dx, dy)),
+            Shape::Highlight { rects, .. } => rects.iter_mut().for_each(|r| *r = r.offset(dx, dy)),
             Shape::Text { pos, .. } => *pos = pos.add(dx, dy),
             Shape::Counter { center, .. } => *center = center.add(dx, dy),
         }
@@ -293,6 +301,7 @@ impl Shape {
             }
             Shape::Line { a, b, .. } | Shape::Arrow { a, b, .. } => a.dist(*b) < 3.0,
             Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } => pts.is_empty(),
+            Shape::Highlight { rects, .. } => rects.is_empty(),
             Shape::Text { text, .. } => text.trim().is_empty(),
             Shape::Counter { .. } => false,
         }
