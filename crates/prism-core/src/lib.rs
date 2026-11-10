@@ -6,6 +6,7 @@ pub mod color;
 pub mod doc;
 pub mod geom;
 pub mod icon;
+pub mod import;
 pub mod image;
 pub mod naming;
 pub mod render;

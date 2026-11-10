@@ -12,6 +12,7 @@ mod app;
 mod capture;
 mod clipboard;
 mod hotkey;
+mod import;
 mod keyhook;
 mod ocr;
 mod overlay;

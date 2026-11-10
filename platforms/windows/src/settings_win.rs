@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmExtendFrameIntoClientArea, DwmFlush, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, ClientToScreen, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection,
     CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, GdiFlush,
     GetMonitorInfoW, GetSysColor, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     MonitorFromPoint, OUT_TT_PRECIS, PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkColor, SetTextColor, SYS_COLOR_INDEX,
@@ -490,6 +490,10 @@ enum Ctl {
     OpenFolder,
     FileName,
     Chip(usize),
+    /// Which app to bring settings over from.
+    ImportFrom,
+    /// Bring the chosen app's settings over, or put back what was there.
+    Import,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -530,6 +534,8 @@ enum Kind {
     Picker(usize),
     /// Where the editing toolbar goes around the region; the spot chosen.
     BarPicker(usize),
+    /// A list to choose from, showing the item chosen.
+    Dropdown { label: &'static str },
 }
 
 #[derive(Clone)]
@@ -691,6 +697,12 @@ struct State {
     preview: bool,
     /// This window is the welcome rather than Settings.
     welcome: Option<Welcome>,
+    /// Other screenshot apps found on this computer, with settings that can come over.
+    imports: Vec<crate::import::Other>,
+    /// The last app brought over, and the settings from before, so Undo can put them back.
+    /// Which of `imports` the dropdown has chosen.
+    import_pick: usize,
+    import_undo: Option<(usize, Settings)>,
     /// The canvas's size, kept for while it's lent out to be drawn on.
     canvas_size: (i32, i32),
 }
@@ -1148,6 +1160,13 @@ fn layout(s: &State) -> Scene {
     }
     l.end_section();
 
+    // Import, last: it's a one-off, offered first in the welcome.
+    if !s.imports.is_empty() {
+        l.section("Import", None);
+        import_rows(&mut l);
+        l.end_section();
+    }
+
     l.y += s.px(4.0);
     let footer = format!("{} {} \u{00B7} Changes save as you make them", crate::util::APP_NAME, env!("CARGO_PKG_VERSION"));
     l.scene.notes.push(Note { x: -1, y: l.y, lines: vec![footer], tone: Tone::Muted, font: SMALL });
@@ -1185,6 +1204,93 @@ fn update_rows(l: &mut Layout) {
     let w = ["Downloading\u{2026}", "Install now", "Check now"].iter().map(|t| s.measure(t, STRONG).0).max().unwrap_or(0) + s.px(36.0);
     l.reserve = vec![ready("10.10.10")];
     l.row(&format!("Prism {}", env!("CARGO_PKG_VERSION")), &desc, tone, Some((Ctl::Update, kind, w, s.px(CONTROL_H))), false);
+}
+
+/// The other screenshot apps found, named as a sentence would: "ShareX and Greenshot".
+fn found_names(s: &State) -> String {
+    let names: Vec<&str> = s.imports.iter().map(|o| o.app.name()).collect();
+    match names.split_last() {
+        Some((last, [])) => last.to_string(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// Bringing settings over from another screenshot app: which app, from a list of the ones found,
+/// and what that would change, with the button that does it, or puts it back. Nothing when no
+/// other app was found.
+fn import_rows(l: &mut Layout) {
+    let s = l.s;
+    let Some(other) = s.imports.get(s.import_pick) else { return };
+    let name = other.app.name();
+    let list_w = s.imports.iter().map(|o| s.measure(o.app.name(), STRONG).0).max().unwrap_or(0) + s.px(64.0);
+    let found = if s.imports.len() == 1 { format!("Prism found {name} on this PC.") } else { format!("Prism found {} on this PC.", found_names(s)) };
+    l.row("Import from", &found, Tone::Subtle, Some((Ctl::ImportFrom, Kind::Dropdown { label: name }, list_w.max(s.px(150.0)), s.px(CONTROL_H))), false);
+
+    let button_w = ["Import", "Undo"].iter().map(|t| s.measure(t, STRONG).0).max().unwrap_or(0) + s.px(44.0);
+    let button = |label: &'static str| Some((Ctl::Import, Kind::Button { label, ghost: false }, button_w, s.px(CONTROL_H)));
+    if s.import_undo.as_ref().is_some_and(|(at, _)| *at == s.import_pick) {
+        l.row("Imported", &format!("Your {name} settings are in. Undo puts back what you had before."), Tone::Accent, button("Undo"), false);
+        return;
+    }
+    let changes = other.found.changes(&s.settings, crate::util::now_stamp());
+    if changes.is_empty() {
+        l.row("Nothing to change", &format!("Prism already works the way {name} is set up."), Tone::Subtle, None, false);
+        return;
+    }
+    let mut desc = prism_core::import::sentence(&changes);
+    if other.running {
+        desc.push_str(&format!(" Quit {name} afterwards, so the two don't share shortcuts."));
+    }
+    l.row("What changes", &desc, Tone::Subtle, button("Import"), false);
+}
+
+/// Opens the list of apps under its dropdown, and picks the one chosen.
+fn pick_import(s: &mut State) {
+    let Some(rect) = s.control(Ctl::ImportFrom).map(|c| s.on_screen(c.rect)) else { return };
+    let names: Vec<&str> = s.imports.iter().map(|o| o.app.name()).collect();
+    let mut corner = POINT { x: rect.x, y: rect.bottom() + s.px(4.0) };
+    unsafe {
+        let _ = ClientToScreen(s.hwnd, &mut corner);
+    }
+    if let Some(i) = crate::tray::choose(s.hwnd, &names, s.import_pick, corner.x, corner.y) {
+        s.import_pick = i;
+        s.restage();
+    }
+}
+
+/// Brings the chosen app's settings over, or, if they were the last brought over, puts back what
+/// was there before.
+fn import_or_undo(s: &mut State) {
+    let i = s.import_pick;
+    let applied = match s.import_undo.take() {
+        Some((at, before)) if at == i => commit(s, |settings| prism_core::import::undo(&before, settings)),
+        earlier => {
+            let Some(found) = s.imports.get(i).map(|o| o.found.clone()) else {
+                s.import_undo = earlier;
+                return;
+            };
+            let before = s.settings.clone();
+            let stamp = crate::util::now_stamp();
+            let applied = commit(s, |settings| {
+                found.apply(settings, stamp);
+            });
+            s.import_undo = Some((i, before));
+            applied
+        }
+    };
+    // Say on the shortcuts themselves if any couldn't be taken, as when they're set there.
+    s.slot_notes = Default::default();
+    for (at, problem) in &applied.hotkey_problems {
+        if let Some(note) = s.slot_notes.get_mut(*at) {
+            *note = Some(format!("{problem}. Click to try another."));
+        }
+    }
+    s.print_screen_problem = applied.hotkey_problems.iter().find(|(at, _)| *at == crate::app::PRINT_SCREEN_SLOT).map(|(_, problem)| {
+        format!("{problem}. Sign out and back in once, then try again, so Windows lets go of it.")
+    });
+    s.snipping_failed = s.settings.replace_snipping && !applied.snipping_ok;
+    s.restage();
 }
 
 thread_local! {
@@ -1256,7 +1362,38 @@ const LIVE_DESC: &str = "Videos and animations keep playing, and the screen is c
 // right, and Back and Next at the foot. It's Settings underneath, so its switches, choices and
 // shortcut fields are the same ones, and save the same way.
 
-const WELCOME_STEPS: [&str; 4] = ["Welcome", "Shortcut", "Capturing", "Done"];
+/// The welcome's pages, in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    Welcome,
+    /// Only when another screenshot app is found.
+    Import,
+    Shortcut,
+    Capturing,
+    Done,
+}
+
+impl Step {
+    fn name(self) -> &'static str {
+        match self {
+            Step::Welcome => "Welcome",
+            Step::Import => "Import",
+            Step::Shortcut => "Shortcut",
+            Step::Capturing => "Capturing",
+            Step::Done => "Done",
+        }
+    }
+}
+
+/// The welcome's pages: Import comes second, and only when there's something to import from.
+fn welcome_steps(s: &State) -> Vec<Step> {
+    let mut steps = vec![Step::Welcome];
+    if !s.imports.is_empty() {
+        steps.push(Step::Import);
+    }
+    steps.extend([Step::Shortcut, Step::Capturing, Step::Done]);
+    steps
+}
 const WELCOME_W: f32 = 820.0;
 const WELCOME_H: f32 = 580.0;
 const RAIL_W: f32 = 236.0;
@@ -1303,8 +1440,9 @@ fn capture_keys(s: &State) -> (String, Vec<String>) {
 fn welcome_layout(s: &State, page: usize) -> Scene {
     let mut l = Layout { s, scene: Scene::default(), y: s.px(PAGE_TOP), x: content_x(s), w: content_w(s), card_top: 0, reserve: Vec::new(), caps: Vec::new() };
     let title_gap = 6.0;
-    match page {
-        0 => {
+    let step = welcome_steps(s).get(page).copied().unwrap_or(Step::Done);
+    match step {
+        Step::Welcome => {
             l.text(&format!("Welcome to {}", crate::util::APP_NAME), TITLE, Tone::Text, title_gap);
             l.text("Capture the screen, mark it up right where you took it, and copy or save it with one key.", BODY, Tone::Subtle, 22.0);
             l.card();
@@ -1313,7 +1451,15 @@ fn welcome_layout(s: &State, page: usize) -> Scene {
             l.row("Kept on this PC", "No account and nothing sent anywhere. Captures go only where you copy or save them.", Tone::Subtle, None, false);
             l.end_section();
         }
-        1 => {
+        Step::Import => {
+            l.text("Coming from another app?", TITLE, Tone::Text, title_gap);
+            let found = found_names(s);
+            l.text(&format!("Bring your shortcuts and choices over from {found}, or skip this. You can import later from Settings too."), BODY, Tone::Subtle, 22.0);
+            l.card();
+            import_rows(&mut l);
+            l.end_section();
+        }
+        Step::Shortcut => {
             l.text("Your shortcut", TITLE, Tone::Text, title_gap);
             l.text("Press it anywhere, in any app, to capture a region or a window.", BODY, Tone::Subtle, 18.0);
             let (keys, others) = capture_keys(s);
@@ -1328,7 +1474,7 @@ fn welcome_layout(s: &State, page: usize) -> Scene {
             l.end_section();
             l.note("The other shortcuts, for the whole screen, copying text and the last region, are in Settings, under Shortcuts.", Tone::Muted);
         }
-        2 => {
+        Step::Capturing => {
             l.text("How you like to capture", TITLE, Tone::Text, title_gap);
             l.text("Change any of these later in Settings.", BODY, Tone::Subtle, 18.0);
             l.card();
@@ -1338,7 +1484,7 @@ fn welcome_layout(s: &State, page: usize) -> Scene {
             l.toggle(&format!("Start {} when I sign in", crate::util::APP_NAME), "It waits quietly in the tray.", Tone::Subtle, Ctl::Autostart, s.autostart);
             l.end_section();
         }
-        _ => {
+        Step::Done => {
             l.text("You're all set", TITLE, Tone::Text, title_gap);
             let (keys, others) = capture_keys(s);
             let how = if keys.is_empty() { "Click Prism's icon in the tray to capture.".to_string() } else { format!("Press {} to capture.", spoken(&keys)) };
@@ -1357,9 +1503,10 @@ fn welcome_layout(s: &State, page: usize) -> Scene {
     let (w, h) = (s.px(BUTTON_W), s.px(34.0));
     let y = footer_top(s) + (s.px(FOOTER_H) - h) / 2;
     let right = s.size().0 - s.px(SIDE);
-    let next = match page {
-        0 => "Get started",
-        3 => "Capture now",
+    let next = match step {
+        Step::Welcome => "Get started",
+        Step::Import if s.import_undo.is_none() => "Skip",
+        Step::Done => "Capture now",
         _ => "Next",
     };
     l.scene.controls.push(Control { ctl: Ctl::Next, rect: IRect::new(right - w, y, w, h), kind: Kind::Primary { label: next } });
@@ -1373,6 +1520,7 @@ fn welcome_layout(s: &State, page: usize) -> Scene {
 
 /// Goes to another page of the welcome, sliding it in from the side it comes from.
 fn welcome_go(s: &mut State, page: usize) {
+    let page = page.min(welcome_steps(s).len() - 1);
     let Some(w) = &mut s.welcome else { return };
     if page == w.page {
         return;
@@ -1380,7 +1528,7 @@ fn welcome_go(s: &mut State, page: usize) {
     stop_recording(s);
     let Some(w) = &mut s.welcome else { return };
     w.forward = page > w.page;
-    w.page = page.min(WELCOME_STEPS.len() - 1);
+    w.page = page;
     s.focus = None;
     s.hover = None;
     s.hover_row = None;
@@ -1427,7 +1575,8 @@ fn draw_welcome_chrome(s: &mut State, pm: &mut PixmapMut) {
     let (left, dot, row) = (s.px(40.0), s.px(24.0), s.px(40.0));
     let top = name_top + s.px(84.0);
     let thin = s.px(1.0).max(1);
-    for (i, name) in WELCOME_STEPS.iter().enumerate() {
+    let steps = welcome_steps(s);
+    for (i, name) in steps.iter().map(|step| step.name()).enumerate() {
         let y = top + i as i32 * row;
         let (done, here) = (i < current, i == current);
         let circle = IRect::new(left, y, dot, dot);
@@ -1454,7 +1603,7 @@ fn draw_welcome_chrome(s: &mut State, pm: &mut PixmapMut) {
         let (font, color) = if here { (Font { px: 14.0, weight: 600 }, p.text) } else if done { (LABEL, p.secondary) } else { (LABEL, p.muted) };
         let label_y = y + (dot - s.line_h(font)) / 2;
         s.draw_text(pm, name, font, left + dot + s.px(14.0), label_y, color);
-        if i + 1 < WELCOME_STEPS.len() {
+        if i + 1 < steps.len() {
             let line_top = y + dot + s.px(4.0);
             ui::fill_rect(pm, IRect::new(left + dot / 2 - thin / 2, line_top, thin, row - dot - s.px(8.0)), if done { p.accent } else { p.line(0.12) });
         }
@@ -1834,6 +1983,24 @@ fn draw_control(s: &mut State, pm: &mut PixmapMut, c: &Control) {
                 stroke_rr(pm, x, y, w, h, h / 2.0, 1.0, p.text);
             }
             s.draw_text_centered(pm, label, STRONG, r, p.on_accent);
+        }
+        Kind::Dropdown { label } => {
+            let lit = s.anims.follow(Key::Hover(c.ctl), if hovered { 1.0 } else { 0.0 }, QUICK_FADE);
+            let radius = control_radius(s, c);
+            fill_rr(pm, x, y, w, h, radius, p.ink(if pressed { 0.12 } else { 0.05 + 0.04 * lit }));
+            stroke_rr(pm, x, y, w, h, radius, s.scale.max(1.0).round(), p.line(0.06 + 0.04 * lit));
+            let pad = s.px(12.0);
+            s.draw_text(pm, label, STRONG, r.x + pad, r.y + (r.h - s.line_h(STRONG)) / 2, p.text);
+            // A chevron pointing down, at the right.
+            let (cx, cy, u) = (x + w - pad as f32 - 5.0 * s.scale, y + h / 2.0, s.scale);
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - 4.5 * u, cy - 2.0 * u);
+            pb.line_to(cx, cy + 2.5 * u);
+            pb.line_to(cx + 4.5 * u, cy - 2.0 * u);
+            if let Some(path) = pb.finish() {
+                let stroke = Stroke { width: 1.6 * u, line_cap: LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Stroke::default() };
+                pm.stroke_path(&path, &paint(mix(p.subtle, p.text, lit)), &stroke, Transform::identity(), None);
+            }
         }
         Kind::Recorder(slot) => {
             let listening = s.recording == Some(*slot);
@@ -2410,7 +2577,7 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
         }
         Ctl::Next => {
             let page = s.welcome.as_ref().map_or(0, |w| w.page);
-            if page + 1 < WELCOME_STEPS.len() {
+            if page + 1 < welcome_steps(s).len() {
                 welcome_go(s, page + 1);
             } else {
                 if let Some(w) = &mut s.welcome {
@@ -2553,6 +2720,8 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
                 commit(s, |settings| settings.save_dir = dir.clone());
             }
         }
+        Ctl::ImportFrom => pick_import(s),
+        Ctl::Import => import_or_undo(s),
         Ctl::OpenFolder => {
             commit_text(s);
             let dir = app::current_save_dir();
@@ -3706,6 +3875,9 @@ fn build(settings: Settings, preview: bool, welcome: bool) -> Option<HWND> {
             edit_brush: HBRUSH::default(),
             preview,
             welcome: welcome.then(|| Welcome { page: 0, forward: true, opened: Instant::now(), capture_after: false }),
+            imports: if preview { Vec::new() } else { crate::import::find() },
+            import_pick: 0,
+            import_undo: None,
             canvas_size: (width, height),
         });
         let pointer = Box::into_raw(owned);
@@ -3735,7 +3907,7 @@ pub fn preview(what: &str, out: &Path) -> i32 {
     let tab_key = parts.next().unwrap_or("general");
     let extras: Vec<&str> = parts.collect();
     // "welcome0" to "welcome3": a page of the welcome.
-    let welcome_page = tab_key.strip_prefix("welcome").map(|n| n.parse::<usize>().unwrap_or(0).min(WELCOME_STEPS.len() - 1));
+    let welcome_page = tab_key.strip_prefix("welcome").map(|n| n.parse::<usize>().unwrap_or(0));
     let tab = match welcome_page {
         Some(_) => 0,
         None => match TAB_KEYS.iter().position(|key| *key == tab_key) {
@@ -3753,6 +3925,21 @@ pub fn preview(what: &str, out: &Path) -> i32 {
     if extras.contains(&"light") {
         s.palette = LIGHT;
     }
+    // Other apps to import from, before choosing a welcome page, as they add one: "import" is
+    // Greenshot and Lightshot, as examples, and "found" is what's really on this computer.
+    if extras.iter().any(|e| matches!(*e, "import" | "imported")) {
+        let ini = "[Core]\nRegionHotkey=PrintScreen\nFullscreenHotkey=Ctrl + PrintScreen\nLastregionHotkey=Shift + PrintScreen\n\
+                   Destinations=FileNoDialog,Clipboard\nCaptureMousepointer=False\nOutputFileFilenamePattern=${capturetime:d\"yyyy-MM-dd HH_mm_ss\"}-${title}\n";
+        let found = prism_core::import::greenshot(ini, &|_| None);
+        s.imports = vec![
+            crate::import::Other { app: prism_core::import::App::Greenshot, found, running: true },
+            crate::import::Other { app: prism_core::import::App::Lightshot, found: prism_core::import::lightshot(), running: false },
+        ];
+    }
+    if extras.contains(&"found") {
+        s.imports = crate::import::find();
+    }
+    s.scene_stale = true;
     s.anims.still = true;
     render(s);
     match welcome_page {
@@ -3769,6 +3956,8 @@ pub fn preview(what: &str, out: &Path) -> i32 {
             "downloading" => PREVIEW_UPDATE.with(|p| *p.borrow_mut() = Some(crate::update::Phase::Downloading("1.1.0".into()))),
             "ready" => PREVIEW_UPDATE.with(|p| *p.borrow_mut() = Some(crate::update::Phase::Ready("1.1.0".into()))),
             "failed" => PREVIEW_UPDATE.with(|p| *p.borrow_mut() = Some(crate::update::Phase::Failed("Couldn't reach GitHub. Check your connection.".into()))),
+            // The first app found, brought over.
+            "imported" => import_or_undo(s),
             "recording" => start_recording(s, 0),
             "problem" => s.slot_notes[0] = Some("Ctrl+Alt+S is already used by another app, so Ctrl+Alt+Shift+S still works. Click to try another.".into()),
             "saved" => {

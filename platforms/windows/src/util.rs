@@ -51,7 +51,7 @@ pub unsafe fn take_boxed<T>(lparam: LPARAM) -> T {
     *unsafe { Box::from_raw(lparam.0 as *mut T) }
 }
 
-fn known_folder(id: &GUID, create: bool) -> Option<PathBuf> {
+pub fn known_folder(id: &GUID, create: bool) -> Option<PathBuf> {
     unsafe {
         let flags = if create { KF_FLAG_CREATE } else { KF_FLAG_DEFAULT };
         let p = SHGetKnownFolderPath(id, flags, None).ok()?;

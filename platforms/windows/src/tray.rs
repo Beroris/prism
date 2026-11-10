@@ -6,8 +6,8 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, Lo
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
-    MF_SEPARATOR, MF_STRING, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, TPM_NONOTIFY,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenu,
 };
 use windows::core::{PCSTR, PCWSTR, w};
 
@@ -121,6 +121,24 @@ pub fn show_menu(hwnd: HWND, hotkeys: &[String; 3], update: Option<&str>) -> Opt
         let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
         let _ = DestroyMenu(menu);
         ALL.into_iter().find(|c| *c as i32 == chosen.0)
+    }
+}
+
+/// A list to choose one item from, opened at `(x, y)` on the screen like a dropdown's, with
+/// `current` ticked. Returns the item chosen, or `None` if it was closed without one. Modal, like
+/// `show_menu`.
+pub fn choose(hwnd: HWND, items: &[&str], current: usize, x: i32, y: i32) -> Option<usize> {
+    unsafe {
+        follow_system_theme(hwnd);
+        let menu = CreatePopupMenu().ok()?;
+        for (i, item) in items.iter().enumerate() {
+            let label = wide(item);
+            let flags = if i == current { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, flags, i + 1, PCWSTR(label.as_ptr()));
+        }
+        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, x, y, None, hwnd, None);
+        let _ = DestroyMenu(menu);
+        (chosen.0 as usize).checked_sub(1).filter(|i| *i < items.len())
     }
 }
 
