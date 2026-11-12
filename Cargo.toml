@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/prism-core", "platforms/windows"]
 
 [workspace.package]
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-only"
