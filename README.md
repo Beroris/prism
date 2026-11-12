@@ -8,6 +8,7 @@ A small, fast screenshot and annotation tool for Windows. Press Print Screen, dr
 
 - **Region, window or screen.** Drag to select, or click to take the window under the cursor. Resize with the handles, or nudge with the arrow keys (Ctrl+arrows resize). F takes the whole monitor and Ctrl+A every monitor.
 - **Annotate in place.** Rectangle, ellipse, line, arrow, pen, highlighter, text, numbered steps, blur and pixelate. Eight colours with an optional fill, the scroll wheel for size, and Shift for straight lines and squares. Undo and redo, and the Select tool moves or deletes what you drew.
+- **Smooth freehand lines.** A light mouse or a trackpad wobbles, and the pen and highlighter iron that out as you draw, without lagging behind the pointer. Pick Off, Light, Medium or Strong in Settings, under Capturing.
 - **A highlighter that snaps.** Start a highlight on a word and it fits a neat box to each line you drag across, out to whole words. Click a word to mark just that word. Buttons and other things on the screen snap the same way. Start anywhere else and it draws freely, and holding Shift (a straight line) or Ctrl also keeps it from snapping.
 - **Live or frozen.** By default the screen freezes the moment you press the shortcut. Turn on live capture in Settings and videos keep playing while you choose, with the shot taken as you let go.
 - **The same region again.** Ctrl+Alt+O captures the region you captured last, straight away, so before-and-after shots line up. Ctrl+Alt+Shift+O opens it ready to mark up instead.
@@ -99,7 +100,7 @@ To regenerate the icon, run `cargo run -p prism-core --example make_ico`.
 
 | Path | What |
 |---|---|
-| `crates/prism-core` | Platform-neutral: annotation model with undo, rendering (tiny-skia), blur, pixelate, PNG, settings, file naming. No OS calls. |
+| `crates/prism-core` | Platform-neutral: annotation model with undo, rendering (tiny-skia), stroke smoothing, blur, pixelate, PNG, settings, file naming. No OS calls. |
 | `platforms/windows` | The Windows app: Win32 + GDI. Tray, hotkeys, capture, overlay editor, clipboard, Windows OCR, toast. |
 | `installer` | The setup wizard (Inno Setup), built by `scripts/package-windows.ps1`. |
 | `assets/fonts` | Geist, the interface font, built into the exe (SIL Open Font License; see `Geist-LICENSE.txt`). |

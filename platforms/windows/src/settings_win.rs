@@ -20,7 +20,7 @@ use crate::util::wide;
 use prism_core::doc::{Tool, ToolKeys, WIDTHS};
 use prism_core::icon::{render_turned, rounded_rect};
 use prism_core::render::{blend_mask, paint_color};
-use prism_core::settings::{EnterAction, FinishKey, Hotkeys, Loaded, PopupPosition, QuickFinish, Settings, ToolbarPlace};
+use prism_core::settings::{EnterAction, FinishKey, Hotkeys, Loaded, PopupPosition, QuickFinish, Settings, Smoothing, ToolbarPlace};
 use prism_core::{IRect, Rgba, naming};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -103,6 +103,7 @@ const QUICK: [(&str, QuickFinish); 5] =
     [("Off", QuickFinish::Off), ("Shift", QuickFinish::Shift), ("Ctrl", QuickFinish::Ctrl), ("Alt", QuickFinish::Alt), ("Always", QuickFinish::Always)];
 const FINISH_KEYS: [(&str, FinishKey); 3] = [("Enter", FinishKey::Enter), ("Esc", FinishKey::Escape), ("Both", FinishKey::Both)];
 const ENTER: [(&str, EnterAction); 3] = [("Copy", EnterAction::Copy), ("Save", EnterAction::Save), ("Both", EnterAction::CopyAndSave)];
+const SMOOTHING: [(&str, Smoothing); 4] = [("Off", Smoothing::Off), ("Light", Smoothing::Light), ("Medium", Smoothing::Medium), ("Strong", Smoothing::Strong)];
 /// The toolbar picker's spots, in the order `bar_spots` lays them out.
 const TOOLBAR_PLACES: [(&str, ToolbarPlace); 8] = [
     ("Above the region, at its left end.", ToolbarPlace::AboveLeft),
@@ -479,6 +480,7 @@ enum Ctl {
     AutoTool,
     StartColor,
     StartWidth,
+    Smoothing,
     FinishKey,
     EnterAction,
     SaveCopies,
@@ -1115,6 +1117,9 @@ fn layout(s: &State) -> Scene {
     l.reserve = (0..=widths.len()).map(width_desc).collect();
     let segs = std::iter::once(Seg::Text("Last")).chain(widths.iter().map(|w| Seg::Dot(*w))).collect();
     l.segments("Start with this size", &width_desc(shown), Ctl::StartWidth, segs, width, 34.0);
+    let smooth = SMOOTHING.iter().position(|(_, m)| *m == set.smoothing).unwrap_or(2);
+    l.reserve = (0..SMOOTHING.len()).map(|i| smoothing_desc(i).to_string()).collect();
+    l.segments("Smooth freehand lines", smoothing_desc(smooth), Ctl::Smoothing, SMOOTHING.iter().map(|(n, _)| Seg::Text(n)).collect(), smooth, 64.0);
     l.end_section();
 
     l.section("Popups", None);
@@ -1680,6 +1685,15 @@ fn enter_desc(i: usize) -> &'static str {
         EnterAction::Copy => "Copy to the clipboard. Ctrl+C always copies, and Ctrl+S always saves.",
         EnterAction::Save => "Save to your folder. Ctrl+C always copies, and Ctrl+S always saves.",
         EnterAction::CopyAndSave => "Copy and save. Ctrl+C always copies, and Ctrl+S always saves.",
+    }
+}
+
+fn smoothing_desc(i: usize) -> &'static str {
+    match SMOOTHING[i.min(SMOOTHING.len() - 1)].1 {
+        Smoothing::Off => "Draw and the highlighter follow the pointer exactly, wobbles and all.",
+        Smoothing::Light => "Takes the jitter out of Draw and the highlighter, and leaves the rest as you drew it.",
+        Smoothing::Medium => "Irons out the wobble of a light mouse or a trackpad in Draw and the highlighter.",
+        Smoothing::Strong => "The smoothest lines. Small loops and sharp corners come out a little rounder.",
     }
 }
 
@@ -2680,6 +2694,12 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
             let tool = auto_tool_of(part);
             if tool != s.settings.auto_tool {
                 commit(s, |settings| settings.auto_tool = tool);
+            }
+        }
+        Ctl::Smoothing => {
+            let smoothing = SMOOTHING[part.min(SMOOTHING.len() - 1)].1;
+            if smoothing != s.settings.smoothing {
+                commit(s, |settings| settings.smoothing = smoothing);
             }
         }
         Ctl::FinishKey => {
