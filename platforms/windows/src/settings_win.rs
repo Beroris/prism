@@ -97,6 +97,9 @@ const TOOL_LISTENING: &str = "Press a letter for this tool. Esc cancels and Back
 const SNIPPING_ON: &str = "These capture a region with Prism instead of opening Snipping Tool.";
 const SNIPPING_OFF: &str = "Snipping Tool has these. Turn this on and they capture a region with Prism instead.";
 const SNIPPING_FAILED: &str = "Couldn't take Win+Shift+S from Snipping Tool, so only Print Screen opens Prism. Try turning this off and on again.";
+const SNIPPING_WAITING: &str = "These capture a region with Prism. Over apps running as administrator, Win+Shift+S opens Snipping Tool until you sign out and back in once.";
+const SEARCH_ON: &str = "Windows turns Win+S off along with Win+Shift+S, so Prism opens Search for it.";
+const SEARCH_OFF: &str = "Win+S does nothing. Search still opens from the taskbar, or with Win+Q.";
 /// The keys Replace Snipping Tool brings, as their key caps show them.
 const SNIPPING_KEYS: [&str; 2] = ["Win+Shift+S", "PrintScreen"];
 const QUICK: [(&str, QuickFinish); 5] =
@@ -470,6 +473,8 @@ enum Ctl {
     /// Check for, install or fetch a new version, as the update has got to.
     Update,
     Snipping,
+    /// Whether Win+S opens Windows Search while Replace Snipping Tool is on.
+    WinSearch,
     Recorder(usize),
     ToolKey(usize),
     ResetToolKeys,
@@ -1312,17 +1317,25 @@ pub fn refresh() {
     }
 }
 
-/// Replace Snipping Tool, with its keys and what it's doing now.
+/// Replace Snipping Tool, with its keys and what it's doing now, and then what Win+S does,
+/// since Windows lets go of it along with Win+Shift+S.
 fn snipping_row(l: &mut Layout) {
     let s = l.s;
+    let waiting = !s.preview && s.settings.replace_snipping && app::snip_key_waiting();
     let (snip, snip_tone) = match (&s.print_screen_problem, s.snipping_failed, s.settings.replace_snipping) {
         (Some(problem), _, true) => (problem.clone(), Tone::Warning),
         (_, true, true) => (SNIPPING_FAILED.to_string(), Tone::Warning),
+        (_, _, true) if waiting => (SNIPPING_WAITING.to_string(), Tone::Subtle),
         (_, _, true) => (SNIPPING_ON.to_string(), Tone::Subtle),
         _ => (SNIPPING_OFF.to_string(), Tone::Subtle),
     };
     l.caps = SNIPPING_KEYS.iter().map(|k| k.to_string()).collect();
     l.toggle("Replace Snipping Tool", &snip, snip_tone, Ctl::Snipping, s.settings.replace_snipping);
+    if s.settings.replace_snipping {
+        let search = if s.settings.win_s_search { SEARCH_ON } else { SEARCH_OFF };
+        l.caps = vec!["Win+S".to_string()];
+        l.toggle("Win+S opens Windows Search", search, Tone::Subtle, Ctl::WinSearch, s.settings.win_s_search);
+    }
 }
 
 /// One of Prism's shortcuts, recorded by clicking it and pressing keys.
@@ -2651,6 +2664,10 @@ fn activate(s: &mut State, ctl: Ctl, part: usize) {
         Ctl::SaveCopies => {
             let on = !s.settings.save_copies;
             commit(s, |settings| settings.save_copies = on);
+        }
+        Ctl::WinSearch => {
+            let on = !s.settings.win_s_search;
+            commit(s, |settings| settings.win_s_search = on);
         }
         Ctl::Notify => {
             let on = !s.settings.notify;

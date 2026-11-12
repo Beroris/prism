@@ -43,6 +43,10 @@ const HK_PRINT_SCREEN: i32 = 4;
 const HOTKEY_SLOTS: [i32; 6] = [HK_REGION, HK_SCREEN, HK_TEXT, HK_LAST, HK_LAST_MARKUP, HK_PRINT_SCREEN];
 /// Where Print Screen comes in `HOTKEY_SLOTS`, for the settings window.
 pub const PRINT_SCREEN_SLOT: usize = 5;
+/// Windows' own Win+Shift+S and Win+S, held while Explorer leaves them alone: see `take_win_keys`.
+const HK_SNIP: i32 = 7;
+const HK_SEARCH: i32 = 8;
+const WIN_SLOTS: [i32; 2] = [HK_SNIP, HK_SEARCH];
 const TRAY_CLICK_TIMER: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +111,10 @@ thread_local! {
     /// The settings window is listening for a new shortcut, so Prism's own are let go until it's
     /// done. Otherwise pressing Print Screen there would start a capture.
     static PAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Replace Snipping Tool was turned off since Prism started. Explorer only notices that it may
+    /// have Win+Shift+S and Win+S again when it next starts, so until then Prism holds them and
+    /// passes them on to Snipping Tool and Search.
+    static HANDED_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn with<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
@@ -159,10 +167,36 @@ impl App {
         }
         let h = &self.settings.hotkeys;
         let print_screen = if uses_print_screen(&self.settings) { "PrintScreen" } else { "" }.to_string();
-        [(HK_REGION, &h.region), (HK_SCREEN, &h.screen), (HK_TEXT, &h.text), (HK_LAST, &h.last), (HK_LAST_MARKUP, &h.last_markup), (HK_PRINT_SCREEN, &print_screen)]
+        let failed = [(HK_REGION, &h.region), (HK_SCREEN, &h.screen), (HK_TEXT, &h.text), (HK_LAST, &h.last), (HK_LAST_MARKUP, &h.last_markup), (HK_PRINT_SCREEN, &print_screen)]
             .into_iter()
             .filter_map(|(id, text)| hotkey::register(self.hwnd, id, text).err().map(|e| (id, e)))
-            .collect()
+            .collect();
+        self.take_win_keys();
+        failed
+    }
+
+    /// Take Win+Shift+S, and Win+S for Search, while Replace Snipping Tool is on. Explorer is told
+    /// to leave them alone, and once it has (from its next start) they're ordinary hotkeys, which
+    /// also work over admin windows. Until then the keyboard hook catches Win+Shift+S, everywhere
+    /// but over admin windows. Returns false if Win+Shift+S couldn't be taken either way.
+    fn take_win_keys(&self) -> bool {
+        if PAUSED.with(|p| p.get()) {
+            return true;
+        }
+        let on = self.settings.replace_snipping;
+        let handed_back = !on && HANDED_BACK.with(|h| h.get());
+        let snip = (on || handed_back) && hotkey::register(self.hwnd, HK_SNIP, "Win+Shift+S").is_ok();
+        if !snip {
+            hotkey::unregister(self.hwnd, HK_SNIP);
+        }
+        // While Explorer still has Win+S, this fails and Explorer goes on opening Search itself.
+        if (on && self.settings.win_s_search) || handed_back {
+            let _ = hotkey::register(self.hwnd, HK_SEARCH, "Win+S");
+        } else {
+            hotkey::unregister(self.hwnd, HK_SEARCH);
+        }
+        let hooked = keyhook::set_enabled(on && !snip, SendHwnd::new(self.hwnd), WM_SNIP_KEY);
+        !on || snip || hooked
     }
 
     fn save_dir(&self) -> PathBuf {
@@ -195,7 +229,7 @@ pub struct Applied {
 /// changed is re-applied: shortcuts are registered again only if they changed, and Snipping
 /// Tool's keys are only touched when that switch moves.
 pub fn update_settings(change: impl FnOnce(&mut Settings)) -> Applied {
-    let Some((hwnd, saved, keys_changed, snipping)) = with(|a| {
+    let Some((saved, keys_changed, search_changed, snipping)) = with(|a| {
         let before = a.settings.clone();
         change(&mut a.settings);
         let snipping = (before.replace_snipping != a.settings.replace_snipping).then_some(a.settings.replace_snipping);
@@ -208,14 +242,17 @@ pub fn update_settings(change: impl FnOnce(&mut Settings)) -> Applied {
         if keys_changed {
             tray::set_tip(a.hwnd, WM_TRAY, &tray_tip(&a.settings));
         }
-        (a.hwnd, a.writable, keys_changed, snipping)
+        (a.writable, keys_changed, before.win_s_search != a.settings.win_s_search, snipping)
     }) else {
         return Applied::default();
     };
     let snipping_ok = match snipping {
-        Some(on) => apply_replace_snipping(hwnd, on),
+        Some(on) => apply_replace_snipping(on),
         None => true,
     };
+    if search_changed {
+        with(|a| a.take_win_keys());
+    }
     let failed = if keys_changed || snipping.is_some() { with(|a| a.register_hotkeys()).unwrap_or_default() } else { Vec::new() };
     let hotkey_problems = failed.into_iter().filter_map(|(id, message)| HOTKEY_SLOTS.iter().position(|slot| *slot == id).map(|at| (at, message))).collect();
     Applied { saved, hotkey_problems, snipping_ok }
@@ -225,18 +262,28 @@ pub fn update_settings(change: impl FnOnce(&mut Settings)) -> Applied {
 /// them back afterwards (`false`).
 pub fn pause_shortcuts(paused: bool) {
     PAUSED.with(|p| p.set(paused));
-    let Some((hwnd, snipping)) = with(|a| (a.hwnd, a.settings.replace_snipping)) else { return };
+    let Some(hwnd) = with(|a| a.hwnd) else { return };
     if paused {
-        for id in HOTKEY_SLOTS {
-            hotkey::unregister(hwnd, id);
-        }
-        keyhook::set_enabled(false, SendHwnd::new(hwnd), WM_SNIP_KEY);
+        release_all(hwnd);
     } else {
+        // Takes Win+Shift+S and Win+S back too, or the hook if Explorer still has them.
         let _ = with(|a| a.register_hotkeys());
-        if snipping {
-            keyhook::set_enabled(true, SendHwnd::new(hwnd), WM_SNIP_KEY);
-        }
     }
+}
+
+/// Let go of every shortcut and the keyboard hook.
+fn release_all(hwnd: HWND) {
+    for id in HOTKEY_SLOTS.into_iter().chain(WIN_SLOTS) {
+        hotkey::unregister(hwnd, id);
+    }
+    keyhook::set_enabled(false, SendHwnd::new(hwnd), WM_SNIP_KEY);
+}
+
+/// Whether Win+Shift+S is still caught by the keyboard hook rather than registered, because
+/// Explorer hasn't restarted since Replace Snipping Tool was turned on. Over admin windows it
+/// still opens Snipping Tool until then.
+pub fn snip_key_waiting() -> bool {
+    keyhook::enabled()
 }
 
 /// Where captures are saved now.
@@ -308,7 +355,7 @@ pub fn start(hwnd: HWND, first_command: Option<Command>, background: bool, updat
     let mut reported = false;
     if replace_snipping {
         // Re-assert on every start: Windows updates sometimes reset the Print Screen setting.
-        apply_replace_snipping(hwnd, true);
+        apply_replace_snipping(true);
     } else if welcome {
         if !prompted {
             with(|a| {
@@ -379,29 +426,36 @@ fn tray_tip(s: &Settings) -> String {
 }
 
 /// Take Snipping Tool's shortcuts (`true`) or hand them back (`false`): the Windows Print
-/// Screen setting, plus the hook for Win+Shift+S. Returns false if the hook couldn't be set.
-fn apply_replace_snipping(hwnd: HWND, on: bool) -> bool {
+/// Screen setting, and Explorer's Win+S keys, which come with Win+Shift+S (see
+/// `App::take_win_keys`). Returns false if Win+Shift+S couldn't be taken.
+fn apply_replace_snipping(on: bool) -> bool {
     system::set_snipping_printscreen(!on);
-    let ok = keyhook::set_enabled(on, SendHwnd::new(hwnd), WM_SNIP_KEY);
-    let _ = with(|a| a.register_hotkeys());
-    ok
+    system::set_explorer_s_keys_off(on);
+    if !on {
+        HANDED_BACK.with(|h| h.set(true));
+    }
+    with(|a| {
+        let _ = a.register_hotkeys();
+        a.take_win_keys()
+    })
+    .unwrap_or(false)
 }
 
 /// The user's choice, from the first-run question.
 fn set_replace_snipping(on: bool) {
-    let Some(hwnd) = with(|a| {
+    let saved = with(|a| {
         a.settings.replace_snipping = on;
         a.settings.printscreen_prompted = true;
         a.save_settings();
-        a.hwnd
-    }) else {
+    });
+    if saved.is_none() {
         return;
-    };
-    let ok = apply_replace_snipping(hwnd, on);
+    }
+    let ok = apply_replace_snipping(on);
     if on && ok {
         toast::show(
             "Snipping Tool's shortcuts are now yours",
-            "Print Screen and Win+Shift+S open Prism. If Print Screen still opens Snipping Tool, sign out and back in once.",
+            "Print Screen and Win+Shift+S open Prism. Sign out and back in once so they also work over apps running as administrator.",
             None,
             None,
             toast::Click::None,
@@ -684,6 +738,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     HK_TEXT => run(Command::Text),
                     HK_LAST => run(Command::Last),
                     HK_LAST_MARKUP => run(Command::LastMarkup),
+                    HK_SNIP if with(|a| a.settings.replace_snipping).unwrap_or(false) => {
+                        // Releasing Win after a hotkey can still open the Start menu.
+                        keyhook::mask_start_menu();
+                        run(Command::Region);
+                    }
+                    // Replace Snipping Tool was turned off, and Explorer hasn't taken these back yet.
+                    HK_SNIP => crate::util::shell_open(Path::new("ms-screenclip:")),
+                    HK_SEARCH => keyhook::open_windows_search(),
                     _ => {}
                 }
                 LRESULT(0)
@@ -742,20 +804,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_DESTROY => {
                 settings_win::close();
-                keyhook::set_enabled(false, SendHwnd::new(hwnd), WM_SNIP_KEY);
                 tray::remove(hwnd, WM_TRAY);
-                for id in HOTKEY_SLOTS {
-                    hotkey::unregister(hwnd, id);
-                }
+                release_all(hwnd);
                 toast::close();
                 PostQuitMessage(0);
                 LRESULT(0)
             }
             m if m != 0 && Some(m) == with(|a| a.taskbar_created) => {
-                // Explorer restarted: put the icon back.
+                // Explorer restarted: put the icon back. It has now read whether to leave the
+                // Win+S keys alone, so Win+Shift+S may be a hotkey Prism can take at last.
                 if let Some(tip) = with(|a| tray_tip(&a.settings)) {
                     tray::add(hwnd, WM_TRAY, &tip);
                 }
+                with(|a| a.take_win_keys());
+                settings_win::refresh();
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),

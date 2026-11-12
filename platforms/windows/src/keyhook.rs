@@ -1,13 +1,15 @@
-//! Takes Win+Shift+S away from Snipping Tool.
+//! Takes Win+Shift+S away from Snipping Tool, until Windows lets Prism register it.
 //!
-//! Windows handles Win+Shift+S inside the shell, so `RegisterHotKey` can't claim it and there is
-//! no setting to turn it off. A low-level keyboard hook sees the key before the shell does: it
-//! swallows the S, sends a harmless "mask" key so that releasing Win doesn't open the Start
-//! menu, and posts a capture request to the main window.
+//! Windows handles Win+Shift+S inside the shell, so `RegisterHotKey` can't claim it while
+//! Explorer has it. Replace Snipping Tool tells Explorer to leave the Win+S keys alone, which
+//! takes effect when Explorer next starts; from then on Win+Shift+S is an ordinary hotkey. Until
+//! then a low-level keyboard hook sees the key before the shell does: it swallows the S, sends a
+//! harmless "mask" key so that releasing Win doesn't open the Start menu, and posts a capture
+//! request to the main window.
 //!
-//! The hook is only installed while the option is on. Per keystroke it does a few comparisons
-//! and keeps no record of what is typed. Windows doesn't send keys from elevated (admin) windows
-//! to it, so there Snipping Tool still gets the shortcut.
+//! The hook is only installed while it's needed. Per keystroke it does a few comparisons and
+//! keeps no record of what is typed. Windows doesn't send keys from elevated (admin) windows to
+//! it, so there Snipping Tool still gets the shortcut; the registered hotkey doesn't have that gap.
 
 use crate::util::SendHwnd;
 use std::cell::Cell;
@@ -43,14 +45,34 @@ pub fn is_snip_chord(vk: u32, win: bool, shift: bool, ctrl: bool, alt: bool) -> 
     vk == VK_S && win && shift && !ctrl && !alt
 }
 
-fn mask_start_menu() {
-    let key = |flags| INPUT {
+fn key(vk: u16, up: bool) -> INPUT {
+    let flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+    INPUT {
         r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(MASK_VK), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: INJECTED_TAG } },
-    };
-    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: INJECTED_TAG } },
+    }
+}
+
+fn send(inputs: &[INPUT]) {
     unsafe {
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// Press and release a key that does nothing, so letting go of Win doesn't open the Start menu.
+pub fn mask_start_menu() {
+    send(&[key(MASK_VK, false), key(MASK_VK, true)]);
+}
+
+/// Open Windows Search, as Win+S did before Explorer was told to leave it alone. Win+Q opens the
+/// same Search and isn't one of the keys turned off. Win is usually still held from Win+S, and
+/// then only Q is pressed, so the user's Win key stays down.
+pub fn open_windows_search() {
+    const VK_Q: u16 = 0x51;
+    if down(VK_LWIN.0) || down(VK_RWIN.0) {
+        send(&[key(VK_Q, false), key(VK_Q, true)]);
+    } else {
+        send(&[key(VK_LWIN.0, false), key(VK_Q, false), key(VK_Q, true), key(VK_LWIN.0, true)]);
     }
 }
 
@@ -83,6 +105,11 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         CallNextHookEx(None, code, wp, lp)
     }
+}
+
+/// Whether the hook is installed.
+pub fn enabled() -> bool {
+    HOOK.get().is_some()
 }
 
 /// Install or remove the hook. `notify` receives `msg` (with a boxed `()` in lParam) each time
