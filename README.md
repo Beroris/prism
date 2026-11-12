@@ -44,11 +44,11 @@ A small, fast screenshot and annotation tool for Windows. Press Print Screen, dr
 
 Change the shortcuts in Settings (right-click the tray icon, then Settings…): click one and press the keys you want.
 
-**Replacing Snipping Tool.** Windows 11 gives Print Screen and Win+Shift+S to Snipping Tool. Turn on **Replace Snipping Tool** in Settings (the app also asks once on first run) and both shortcuts open Prism instead. Print Screen is switched with the setting Windows itself provides. Windows has no setting for Win+Shift+S, so the app catches that key with a keyboard hook, which is only installed while the option is on and keeps no record of what you type. Turn the option off and Snipping Tool gets both shortcuts back. Two limits: in a window running as administrator, Windows doesn't pass keys to the hook, so Snipping Tool still answers there; and if Print Screen keeps opening Snipping Tool, sign out and back in once.
+**Replacing Snipping Tool.** Windows 11 gives Print Screen and Win+Shift+S to Snipping Tool. Turn on **Replace Snipping Tool** in Settings (the app also asks once on first run) and both shortcuts open Prism instead, so nothing starts Snipping Tool at all. Print Screen is switched with the setting Windows itself provides. For Win+Shift+S, the app tells Explorer to leave its Win+S shortcuts alone (the `DisabledHotkeys` value) and registers the key itself, which works over apps running as administrator too. Explorer reads that value when it starts, so until you next sign in, a keyboard hook catches Win+Shift+S instead: it keeps no record of what you type, and Windows doesn't pass it keys from administrator windows. Windows turns Win+S off along with Win+Shift+S, so Prism opens Search for it, unless you turn **Win+S opens Windows Search** off. Turn Replace Snipping Tool off and Windows gets all of these back.
 
 ## Install
 
-Download **Prism-<version>-Setup.exe** from [Releases](https://github.com/Beroris/prism/releases/latest) and run it. It installs for you only, so it doesn't ask for admin rights, and adds Prism to the Start menu. Uninstall it from Settings → Apps like any other app; that also gives Print Screen back to Snipping Tool if Prism had it.
+Download **Prism-<version>-Setup.exe** from [Releases](https://github.com/Beroris/prism/releases/latest) and run it. It installs for you only, so it doesn't ask for admin rights, and adds Prism to the Start menu. Uninstall it from Settings → Apps like any other app; that also gives Snipping Tool its shortcuts back if Prism had them.
 
 To run Prism without installing, download **Prism-<version>-Portable.exe** instead. Run it from anywhere, a USB stick included. It keeps its settings in a "Prism settings" folder beside itself rather than in your profile.
 

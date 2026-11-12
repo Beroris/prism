@@ -211,6 +211,9 @@ pub struct Settings {
     /// Take Snipping Tool's shortcuts (Print Screen and Win+Shift+S) for this app. Turning it
     /// off gives them back.
     pub replace_snipping: bool,
+    /// While `replace_snipping` is on, Win+S opens Windows Search. Taking Win+Shift+S from
+    /// Windows turns off Win+S along with it, so Prism opens Search itself unless this is off.
+    pub win_s_search: bool,
     /// The welcome has been seen, so it doesn't open again. A settings file from before the
     /// welcome existed counts as seen: only someone new gets it.
     #[serde(default = "seen")]
@@ -252,6 +255,7 @@ impl Default for Settings {
             palette: Rgba::DEFAULT_PALETTE.to_vec(),
             printscreen_prompted: false,
             replace_snipping: false,
+            win_s_search: true,
             onboarded: false,
             check_updates: true,
         }

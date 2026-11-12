@@ -82,6 +82,7 @@ Type: dirifempty; Name: "{app}"
 [Code]
 const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  ExplorerAdvanced = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';
 
 { Prism runs Setup with /UPDATE when it updates itself. Setup then changes nothing but the
   app, and starts it again at the end. }
@@ -135,8 +136,8 @@ begin
   Result := ExpandConstant('{userappdata}\{#AppName}\settings.json');
 end;
 
-{ Whether Prism had taken Print Screen from Snipping Tool, so uninstalling gives it back. }
-function TookPrintScreen(): Boolean;
+{ Whether Prism had taken Snipping Tool's shortcuts, so uninstalling gives them back. }
+function TookSnippingKeys(): Boolean;
 var
   Text: AnsiString;
   Flat: String;
@@ -150,13 +151,32 @@ begin
   end;
 end;
 
+{ Let Explorer have the Win+S keys again (Win+Shift+S among them), keeping any other letters
+  in DisabledHotkeys as they were. }
+procedure GiveBackWinS();
+var
+  Letters: String;
+begin
+  if RegQueryStringValue(HKCU, ExplorerAdvanced, 'DisabledHotkeys', Letters) then
+  begin
+    StringChangeEx(Letters, 'S', '', True);
+    if Letters = '' then
+      RegDeleteValue(HKCU, ExplorerAdvanced, 'DisabledHotkeys')
+    else
+      RegWriteStringValue(HKCU, ExplorerAdvanced, 'DisabledHotkeys', Letters);
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
     QuitPrism();
-    if TookPrintScreen() then
+    if TookSnippingKeys() then
+    begin
       RegWriteDWordValue(HKCU, 'Control Panel\Keyboard', 'PrintScreenKeyForSnippingEnabled', 1);
+      GiveBackWinS();
+    end;
     RegDeleteValue(HKCU, RunKey, '{#AppName}');
   end;
   if (CurUninstallStep = usPostUninstall) and DirExists(ExpandConstant('{userappdata}\{#AppName}')) and not UninstallSilent() then

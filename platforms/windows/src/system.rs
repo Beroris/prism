@@ -1,5 +1,6 @@
-//! Registry-backed bits of system integration: start with Windows, and the Windows 11 setting
-//! that gives the Print Screen key to Snipping Tool. Plus the standard dialogs.
+//! Registry-backed bits of system integration: start with Windows, the Windows 11 setting
+//! that gives the Print Screen key to Snipping Tool, and Explorer's Win+S shortcuts. Plus the
+//! standard dialogs.
 
 use crate::util::{APP_NAME, wide, wide_path};
 use std::path::{Path, PathBuf};
@@ -96,6 +97,52 @@ pub fn set_snipping_printscreen(snipping: bool) -> bool {
     ok
 }
 
+/// The letters whose Win shortcuts Explorer leaves alone, as a string such as "SV".
+const ADVANCED_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
+const DISABLED_HOTKEYS: &str = "DisabledHotkeys";
+
+/// `letters` with `letter` added (`on`) or taken out, leaving the others as they were.
+fn with_letter(letters: &str, letter: char, on: bool) -> String {
+    let mut kept: String = letters.chars().filter(|c| !c.eq_ignore_ascii_case(&letter)).collect();
+    if on {
+        kept.push(letter);
+    }
+    kept
+}
+
+/// Make Explorer leave the Win+S shortcuts alone (`true`), Win+Shift+S included, so nothing
+/// opens Snipping Tool and Prism can register the key, even over admin windows. Or let Explorer
+/// have them again (`false`). Explorer reads this when it starts, so it takes effect at the next
+/// sign-in or Explorer restart.
+pub fn set_explorer_s_keys_off(off: bool) -> bool {
+    let now = read_value(ADVANCED_KEY, DISABLED_HOTKEYS)
+        .filter(|(ty, _)| *ty == REG_SZ)
+        .map(|(_, b)| {
+            let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+            String::from_utf16_lossy(&units)
+        })
+        .unwrap_or_default();
+    let next = with_letter(&now, 'S', off);
+    if next == now {
+        return true;
+    }
+    let Some(key) = open_key(ADVANCED_KEY, KEY_SET_VALUE) else { return false };
+    let name = wide(DISABLED_HOTKEYS);
+    let ok = unsafe {
+        if next.is_empty() {
+            RegDeleteValueW(key, PCWSTR(name.as_ptr())).is_ok()
+        } else {
+            let text = wide(&next);
+            let bytes = std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2);
+            RegSetValueExW(key, PCWSTR(name.as_ptr()), Some(0), REG_SZ, Some(bytes)).is_ok()
+        }
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    ok
+}
+
 fn windows_build() -> u32 {
     read_value("Software\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuildNumber")
         .and_then(|(_, b)| {
@@ -170,4 +217,19 @@ pub fn read_string(path: &str, name: &str) -> Option<String> {
     }
     let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
     Some(String::from_utf16_lossy(&units))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_letter;
+
+    #[test]
+    fn letters_keep_the_others() {
+        assert_eq!(with_letter("", 'S', true), "S");
+        assert_eq!(with_letter("V", 'S', true), "VS");
+        assert_eq!(with_letter("SV", 'S', true), "VS");
+        assert_eq!(with_letter("sV", 'S', false), "V");
+        assert_eq!(with_letter("S", 'S', false), "");
+        assert_eq!(with_letter("V", 'S', false), "V");
+    }
 }

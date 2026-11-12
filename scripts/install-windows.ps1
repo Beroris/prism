@@ -23,10 +23,17 @@ function Stop-Running {
 
 if ($Uninstall) {
     Stop-Running
-    # Give Print Screen back to Snipping Tool if this app had taken it.
+    # Give Print Screen and the Win+S keys (Win+Shift+S among them) back if this app had taken them.
     $settings = Join-Path $env:APPDATA "$name\settings.json"
     if ((Test-Path $settings) -and ((Get-Content $settings -Raw | ConvertFrom-Json).replace_snipping)) {
         Set-ItemProperty 'HKCU:\Control Panel\Keyboard' PrintScreenKeyForSnippingEnabled 1 -Type DWord
+        $advanced = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+        $letters = (Get-ItemProperty $advanced -Name DisabledHotkeys -ErrorAction SilentlyContinue).DisabledHotkeys
+        if ($null -ne $letters) {
+            $letters = $letters -replace '[Ss]', ''
+            if ($letters) { Set-ItemProperty $advanced DisabledHotkeys $letters -Type String }
+            else { Remove-ItemProperty $advanced DisabledHotkeys }
+        }
     }
     Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' $name -ErrorAction SilentlyContinue
     Remove-Item $lnk, $dir -Recurse -Force -ErrorAction SilentlyContinue
