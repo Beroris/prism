@@ -437,6 +437,7 @@ pub fn run(cmd: Command) {
                 auto_tool: s.auto_tool,
                 tool_keys: s.tool_keys.clone(),
                 toolbar_place: s.toolbar_place,
+                smoothing: s.smoothing,
                 live: s.live_capture,
                 preset,
             };

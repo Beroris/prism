@@ -78,6 +78,31 @@ pub enum ToolbarPlace {
     Right,
 }
 
+/// How much freehand strokes, from Draw and the highlighter, are smoothed as they're drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Smoothing {
+    /// The stroke follows the pointer exactly.
+    Off,
+    Light,
+    #[default]
+    Medium,
+    Strong,
+}
+
+impl Smoothing {
+    /// How far along the pointer's path, either way, each point of a stroke is averaged over:
+    /// the Gaussian's sigma, in pixels at 100% scale. See `steady.rs`.
+    pub fn sigma(self) -> f32 {
+        match self {
+            Smoothing::Off => 0.0,
+            Smoothing::Light => 4.0,
+            Smoothing::Medium => 8.0,
+            Smoothing::Strong => 13.0,
+        }
+    }
+}
+
 impl FinishKey {
     pub fn enter(self) -> bool {
         matches!(self, FinishKey::Enter | FinishKey::Both)
@@ -177,6 +202,8 @@ pub struct Settings {
     pub start_color: Option<Rgba>,
     /// The size every capture starts with. None carries on with the last one used.
     pub start_width: Option<f32>,
+    /// How much freehand strokes are smoothed.
+    pub smoothing: Smoothing,
     pub palette: Vec<Rgba>,
     /// Whether the user was already asked about taking Print Screen over from Snipping Tool,
     /// so they're asked once, not on every start.
@@ -221,6 +248,7 @@ impl Default for Settings {
             style: Style::default(),
             start_color: None,
             start_width: None,
+            smoothing: Smoothing::Medium,
             palette: Rgba::DEFAULT_PALETTE.to_vec(),
             printscreen_prompted: false,
             replace_snipping: false,
@@ -301,7 +329,16 @@ mod tests {
     #[test]
     fn missing_and_round_trip() {
         assert_eq!(Settings::load(None), Loaded::Missing(Settings::default()));
-        let s = Settings { enter_action: EnterAction::Save, finish_key: FinishKey::Both, quick_finish: QuickFinish::Always, auto_tool: Some(Tool::Draw), popup_position: PopupPosition::TopCenter, toolbar_place: ToolbarPlace::Left, ..Settings::default() };
+        let s = Settings {
+            enter_action: EnterAction::Save,
+            finish_key: FinishKey::Both,
+            quick_finish: QuickFinish::Always,
+            auto_tool: Some(Tool::Draw),
+            popup_position: PopupPosition::TopCenter,
+            toolbar_place: ToolbarPlace::Left,
+            smoothing: Smoothing::Strong,
+            ..Settings::default()
+        };
         assert_eq!(Settings::load(Some(&s.to_json())), Loaded::Ok(s));
     }
 
@@ -311,6 +348,7 @@ mod tests {
             panic!()
         };
         assert!(!s.magnifier);
+        assert_eq!(s.smoothing, Smoothing::Medium, "files from before smoothing get it too");
         assert_eq!(s.hotkeys.text, "Win+Shift+T");
         assert_eq!(s.hotkeys.region, "Ctrl+Alt+S");
     }

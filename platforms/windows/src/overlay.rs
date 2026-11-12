@@ -17,6 +17,7 @@ use crate::util::{SendHwnd, wide};
 use prism_core::doc::{self, Shape, Style, Tool};
 use prism_core::image::copy_rect;
 use prism_core::render::Canvas;
+use prism_core::steady::Steady;
 use prism_core::{Doc, IRect, Image, Pt, Rgba};
 use std::cell::RefCell;
 use tiny_skia::PixmapMut;
@@ -84,6 +85,7 @@ pub struct Options {
     pub auto_tool: Option<Tool>,
     pub tool_keys: prism_core::doc::ToolKeys,
     pub toolbar_place: prism_core::settings::ToolbarPlace,
+    pub smoothing: prism_core::settings::Smoothing,
     /// Keep the screen running until a region is chosen, instead of freezing it straight away.
     pub live: bool,
     /// A region, in screen coordinates, to start with already chosen: the last one, again.
@@ -119,7 +121,8 @@ enum Drag {
     NewSel { start: (i32, i32), moved: bool, inner: bool },
     MoveSel { start: (i32, i32), orig: IRect },
     Resize { handle: Handle, orig: IRect },
-    Draw { shape: Shape, start: Pt },
+    /// `steady` smooths a freehand stroke as it's drawn.
+    Draw { shape: Shape, start: Pt, steady: Steady },
     MoveShape { idx: usize, start: Pt, orig: Shape, cur: Shape, lifted: bool },
 }
 
@@ -209,6 +212,7 @@ pub struct Overlay {
     reselect_from: Option<IRect>,
     tool_keys: prism_core::doc::ToolKeys,
     toolbar_place: prism_core::settings::ToolbarPlace,
+    smoothing: prism_core::settings::Smoothing,
     text: GdiText,
     /// Everything drawn over plain `dim` in the last frame, so it can be cleared next frame.
     last_bounds: IRect,
@@ -341,6 +345,7 @@ pub fn open(main: HWND, opts: Options) -> bool {
             reselect_from: None,
             tool_keys: opts.tool_keys,
             toolbar_place: opts.toolbar_place,
+            smoothing: opts.smoothing,
             text: GdiText::new(),
             last_bounds: IRect::default(),
             layered: live,
@@ -765,9 +770,12 @@ impl Overlay {
         }
         let (w, h) = (self.scratch.w, self.scratch.h);
         // A long stroke: copy what's baked and draw only the newest points.
-        let drawing = matches!(self.drag, Drag::Draw { .. });
-        if let (true, Shape::Pen { pts, style }) = (drawing, &shape) {
-            if let Some(k) = self.bake(sel, pts, *style) {
+        let settled = match &self.drag {
+            Drag::Draw { steady, .. } => Some(steady.settled()),
+            _ => None,
+        };
+        if let (Some(settled), Shape::Pen { pts, style }) = (settled, &shape) {
+            if let Some(k) = self.bake(sel, pts, settled, *style) {
                 self.scratch.data.copy_from_slice(&self.baked.image.data);
                 let tail = Shape::Pen { pts: stroke_from(pts, k), style: *style };
                 if let Some(mut c) = Canvas::new(&mut self.scratch.data, w, h, (sel.x, sel.y)) {
@@ -791,16 +799,19 @@ impl Overlay {
     /// Only the pen: it's opaque, so where the baked and live parts overlap looks the same.
     /// Highlighter strokes are translucent and would darken there. When the stroke ends it's
     /// drawn again whole, so what's kept is exact.
-    fn bake(&mut self, sel: IRect, pts: &[Pt], style: Style) -> Option<usize> {
+    ///
+    /// Only the first `settled` points are baked: smoothing still moves the newer ones.
+    fn bake(&mut self, sel: IRect, pts: &[Pt], settled: usize, style: Style) -> Option<usize> {
         if self.baked.sel != sel || self.baked.upto >= pts.len() {
             // A new selection, or Shift made the stroke straight.
             self.baked.upto = 0;
         }
         let k = self.baked.upto;
-        if pts.len() - k <= BAKE_AFTER {
+        let live = pts.len() - k;
+        let upto = if live > BAKE_AFTER { (pts.len() - BAKE_AFTER / 2).min(settled.saturating_sub(1)) } else { 0 };
+        if upto <= k {
             return (k > 0).then_some(k);
         }
-        let upto = pts.len() - BAKE_AFTER / 2;
         if k == 0 {
             self.baked.sel = sel;
             self.baked.image = Image::new(sel.w as u32, sel.h as u32);
@@ -1303,8 +1314,10 @@ impl Overlay {
                     Tool::Pixelate => Shape::Pixelate { a: p, b: p, block: (st.width * 3.0).max(8.0) },
                     Tool::Select | Tool::Text => unreachable!(),
                 };
+                let sigma = if matches!(tool, Tool::Draw | Tool::Highlighter) { self.smoothing.sigma() * self.scale() } else { 0.0 };
+                let steady = Steady::new(p, sigma);
                 self.baked.upto = 0;
-                self.drag = Drag::Draw { shape, start: p };
+                self.drag = Drag::Draw { shape, start: p, steady };
                 self.update_scratch();
             }
         }
@@ -1351,7 +1364,7 @@ impl Overlay {
                     self.sel = Some(n);
                 }
             }
-            Drag::Draw { shape, start } => {
+            Drag::Draw { shape, start, steady } => {
                 let start = *start;
                 match shape {
                     Shape::Rect { b, .. } | Shape::Ellipse { b, .. } => *b = if shift { doc::snap_square(start, p) } else { p },
@@ -1359,11 +1372,13 @@ impl Overlay {
                     Shape::Blur { b, .. } | Shape::Pixelate { b, .. } => *b = p,
                     Shape::Pen { pts, .. } | Shape::Highlighter { pts, .. } => {
                         if shift {
-                            // Shift draws a straight stroke from the start.
+                            // Shift draws a straight stroke from the start. Let go of it and the
+                            // stroke carries on from there.
                             pts.truncate(1);
                             pts.push(doc::snap_angle(start, p));
-                        } else if pts.last().is_none_or(|l| l.dist(p) >= 1.5) {
-                            pts.push(p);
+                            steady.restart(pts);
+                        } else {
+                            steady.follow(pts, p);
                         }
                     }
                     Shape::Counter { center, .. } => *center = p,
@@ -1906,6 +1921,7 @@ pub fn render_offscreen(script: &str) -> Option<Image> {
         reselect_from: None,
         tool_keys: Default::default(),
         toolbar_place: Default::default(),
+        smoothing: Default::default(),
         layered: false,
         live: false,
         unseen: false,
@@ -1976,6 +1992,51 @@ pub fn render_offscreen(script: &str) -> Option<Image> {
             let pts = vec![Pt::new(x + 600.0, y + 100.0), Pt::new(x + 640.0, y + 260.0)];
             let s = ov.snapped(Shape::Highlighter { pts, style: Style { color: Rgba::GREEN, ..st } });
             ov.commit_shape(s);
+        }
+        // Wobbly strokes dragged through the mouse handlers, as a light mouse would draw them:
+        // the top row as drawn, the bottom row smoothed. The last stroke is still being drawn,
+        // so its older part comes from what was baked.
+        "draw" => {
+            let sel = IRect::new(cx - 450, cy - 280, 900, 560);
+            ov.sel = Some(sel);
+            ov.tool = Tool::Draw;
+            ov.style = Style { color: Rgba::RED, width: 4.0, fill: false };
+            // Mouse handlers ask for a repaint; with no window, keep that to drawing offscreen.
+            ov.layered = true;
+            // Waves across the path, a few pixels high and 6 to 33 pixels long.
+            let wobble = |s: f32| [(6.0, 0.7), (11.0, 1.0), (19.0, 1.4), (33.0, 1.6)].iter().map(|(l, a)| a * (s / l * std::f32::consts::TAU + l).sin()).sum::<f32>();
+            let (x, y) = (sel.x as f32, sel.y as f32);
+            for (row, smoothing) in [prism_core::settings::Smoothing::Off, prism_core::settings::Smoothing::Medium].into_iter().enumerate() {
+                ov.smoothing = smoothing;
+                let top = y + 30.0 + row as f32 * 270.0;
+                let circle = |t: f32| Pt::new(x + 140.0 + 100.0 * (t * 6.6).cos(), top + 110.0 + 90.0 * (t * 6.6).sin());
+                let wave = |t: f32| Pt::new(x + 300.0 + t * 560.0, top + 110.0 + 70.0 * (t * 9.0).sin());
+                let strokes: [&dyn Fn(f32) -> Pt; 2] = [&circle, &wave];
+                for (n, path) in strokes.into_iter().enumerate() {
+                    // About 3 px per mouse move.
+                    let (mut t, mut s, mut last) = (0.0, 0.0, path(0.0));
+                    ov.on_mouse_down(last.x as i32, last.y as i32);
+                    while t <= 1.0 {
+                        let p = path(t);
+                        let ahead = path(t + 1e-4);
+                        let (dx, dy) = (ahead.x - p.x, ahead.y - p.y);
+                        let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                        s += p.dist(last);
+                        last = p;
+                        let w = wobble(s);
+                        ov.on_mouse_move((p.x - dy / l * w).round() as i32, (p.y + dx / l * w).round() as i32);
+                        t += 3.0 / l * 1e-4;
+                    }
+                    if !(row == 1 && n == 1) {
+                        let (mx, my) = ov.mouse;
+                        ov.on_mouse_up(mx, my);
+                    }
+                }
+            }
+            ov.layered = false;
+            if ov.scratch_stale {
+                ov.update_scratch();
+            }
         }
         _ => {
             // "annotated": a selection with one of each shape, the palette open and a tooltip.

@@ -12,6 +12,7 @@ pub mod naming;
 pub mod render;
 pub mod settings;
 pub mod snap;
+pub mod steady;
 pub mod update;
 
 pub use color::Rgba;
